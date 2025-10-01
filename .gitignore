@@ -1,0 +1,26 @@
+﻿# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+env/
+.conda/
+.ipynb_checkpoints/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Outputs / logs
+*.csv
+*.html
+*.log
+
+# If you want to KEEP the website template checked-in, remove '*.html' above
+# and optionally whitelist your template:
+#!iv_live_30d.html
