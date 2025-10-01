@@ -1,30 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-IV Agent for NSE Stocks – CSV + Website (Cards + Click-to-Detail + Payoff Graph)
+IV Agent – NSE live IV → Multi-strategy ranking + Website (Top Picks + Payoff)
 
-- Home shows ONLY stock cards (Symbol, Spot, IV, Primary Strategy)
-- Click a card → detail view with:
-    • Full IC / BPS / LS stats (per share & per 1 lot)
-    • Interactive payoff graph @ expiry (toggle strategies; ±1σ/±1.5σ/±2σ range)
-    • Math notes + live example
-- Lot sizes auto-fetched from NSE (Permitted lot size .csv)
-- CSV is UTF-8-BOM for Excel (₹ / ± / – render correctly)
+Adds & ranks (most) strategies you listed. Naked shorts are OFF by default.
+Calendars/Jade-Lizard/Batman/Double-Plateau/Range-Forward are stubbed.
 
 Run (example):
-  python iv_agent.py --tickers "RELIANCE,ICICIBANK,HDFCBANK,SBIN,TCS,INFY,ITC,BPCL,AMBUJACEM,AXISBANK,APOLLOHOSP,ASIANPAINT,BAJAJ_AUTO,BAJFINANCE,BEL,BRITANNIA,BSE,DALBHARAT,DIVISLAB,DIXON,EICHERMOT,GRASIM,HAVELLS,HCLTECH,HDFCLIFE,HEROMOTOCO,HINDALCO,ICICIPRULI,INDIGO,INDUSINDBK,JSWSTEEL,JINDALSTEL,JUBLFOOD,KOTAKBANK,LAURUSLABS,LICHSGFIN,LT,LTIM,M&M,ONGC,SHREECEM,TATAMOTORS,TATASTEEL,TECHM,TITAN,UPL,ADANIENT,ADANIPORTS" ^
-    --days 30 --live_iv --use_yfinance_fallback ^
+  python iv_agent.py --tickers "RELIANCE,ICICIBANK,SBIN,TCS,INFY,ITC,BPCL,AMBUJACEM,AXISBANK,APOLLOHOSP,ASIANPAINT,BAJAJ_AUTO,BAJFINANCE,BEL,BRITANNIA,BSE,DALBHARAT,DIVISLAB,DIXON,EICHERMOT,GRASIM,HAVELLS,HCLTECH,HDFCLIFE,HEROMOTOCO,HINDALCO,ICICIPRULI,INDIGO,INDUSINDBK,JSWSTEEL,JINDALSTEL,JUBLFOOD,KOTAKBANK,LAURUSLABS,LICHSGFIN,LT,LTIM,M&M,ONGC,SHREECEM,TATAMOTORS,TATASTEEL,TECHM,TITAN,UPL,ADANIENT,ADANIPORTS" ^
+    --days 30 --live_iv --use_yfinance_fallback --open_html ^
     --sigma_ic 1.3 --sigma_bps 1.1 --sigma_ls 0.9 ^
     --width_pct_ic 0.025 --width_pct_bps 0.02 ^
-    --default_iv 0.25 --out_csv iv_live_30d.csv --html_out iv_live_30d.html --open_html
+    --default_iv 0.25 --top_n 3
+
+Safety:
+  Add --allow_naked if you want naked Sell Call / Sell Put / Short Strangle / Short Straddle considered.
 """
 
 from __future__ import annotations
-import argparse, csv, math, sys, time, datetime as dt, os, webbrowser, io, json
+import argparse, csv, math, sys, time, datetime as dt, os, webbrowser, io, json, random
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote
-
 import requests
 
 # --------------------------- Math & Pricing ----------------------------------
@@ -32,8 +29,12 @@ import requests
 def norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
+def norm_pdf(x: float) -> float:
+    invsqrt2pi = 0.3989422804014327
+    return invsqrt2pi * math.exp(-0.5 * x * x)
+
 def bs_price(S: float, K: float, t: float, r: float, sigma: float, q: float = 0.0, option_type: str = "call") -> float:
-    S = max(1e-9, float(S)); K = max(1e-9, float(K)); t = max(1e-9, float(t)); sigma = max(1e-9, float(sigma))
+    S = max(1e-9, float(S)); K = max(1e-9, float(K)); t = max(1e-9, float(t)); sigma = max(1e-6, float(sigma))
     d1 = (math.log(S / K) + (r - q + 0.5 * sigma * sigma) * t) / (sigma * math.sqrt(t))
     d2 = d1 - sigma * math.sqrt(t)
     if option_type == "call":
@@ -54,38 +55,39 @@ def round_to_stride(x: float, stride: int) -> int:
 
 # ---------------------------- Config / Aliases -------------------------------
 
-NSE_SYMBOL_ALIASES = {
-    "BAJAJ_AUTO": "BAJAJ-AUTO",
-}
+NSE_SYMBOL_ALIASES = { "BAJAJ_AUTO": "BAJAJ-AUTO" }
 def normalize_symbol_for_api(sym: str) -> str:
-    s = sym.strip().upper()
-    s = NSE_SYMBOL_ALIASES.get(s, s)
-    return quote(s, safe="")  # URL-encode (e.g., M&M -> M%26M)
-
+    s = sym.strip().upper(); s = NSE_SYMBOL_ALIASES.get(s, s)
+    return quote(s, safe="")
 def normalize_symbol_key(sym: str) -> str:
-    s = sym.strip().upper()
-    return NSE_SYMBOL_ALIASES.get(s, s)
+    s = sym.strip().upper(); return NSE_SYMBOL_ALIASES.get(s, s)
 
 # ------------------------------ Data Models ----------------------------------
 
 @dataclass
-class StrategyResult:
+class Strategy:
+    key: str
     name: str
-    action: str
-    credit_or_debit: float   # +credit (sell) or -debit (buy) per share
-    be_low: Optional[float]
-    be_high: Optional[float]
-    max_profit: Optional[float]
-    max_loss: Optional[float]
+    style: str    # 'credit' or 'debit'
+    risk_cap: str # 'capped' or 'uncapped'
+    group: str    # Bullish/Bearish/Neutral/Other
+
+@dataclass
+class StratResult:
+    key: str; name: str; style: str; group: str
+    credit_debit_sh: float                  # +credit (sell) / -debit (buy)
+    be_low: Optional[float]; be_high: Optional[float]
+    max_profit_sh: Optional[float]; max_loss_sh: Optional[float]  # per share
     roi: Optional[float]
-    strikes: Dict[str, int]
+    strikes: Dict[str, int]                 # legs / strikes
+    pop: Optional[float]                    # probability of profit (approx)
+    notes: str                              # short note on rule used
 
 # ------------------------------ NSE Fetch ------------------------------------
 
 NSE_HEADERS = {
-    "user-agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/120.0.0.0 Safari/537.36"),
+    "user-agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
     "accept-language": "en-US,en;q=0.9",
     "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
@@ -102,7 +104,7 @@ def fetch_iv_spot_from_nse(symbol: str, horizon_days: int, retries: int = 3, sle
         url = f"https://www.nseindia.com/api/option-chain-equities?symbol={sym_q}"
         sess = _nse_session(); resp = None
         for _ in range(retries):
-            resp = sess.get(url, headers={**NSE_HEADERS, "referer": "https://www.nseindia.com/option-chain"}, timeout=12)
+            resp = sess.get(url, headers={**NSE_HEADERS,"referer":"https://www.nseindia.com/option-chain"}, timeout=12)
             if resp.status_code == 200: break
             time.sleep(sleep_s); sess = _nse_session()
         if resp is None or resp.status_code != 200: return None, None, None
@@ -112,17 +114,15 @@ def fetch_iv_spot_from_nse(symbol: str, horizon_days: int, retries: int = 3, sle
         if not underlying: return None, None, None
         underlying = float(underlying)
 
-        # choose closest expiry to horizon
         today = dt.date.today(); target = today + dt.timedelta(days=horizon_days)
-        exps = rec.get("expiryDates", []) or []
+        exps = rec.get("expiryDates") or []
         def p(x):
             try: return dt.datetime.strptime(x, "%d-%b-%Y").date()
             except: return None
-        exps = [(s, p(s)) for s in exps]; exps = [(s,d) for s,d in exps if d]
+        exps = [(s, p(s)) for s in exps if p(s)]
         if not exps: return underlying, None, None
         chosen_exp, _ = min(exps, key=lambda x: abs((x[1]-target).days))
 
-        # filter rows for chosen expiry
         chain = rec.get("data", [])
         rows = [r for r in chain if r.get("expiryDate")==chosen_exp]
         if not rows:
@@ -130,10 +130,9 @@ def fetch_iv_spot_from_nse(symbol: str, horizon_days: int, retries: int = 3, sle
             rows = [r for r in rows if r.get("expiryDate")==chosen_exp]
         if not rows: return underlying, None, chosen_exp
 
-        # closest strike to spot
         atm_row, best = None, 1e18
         for r0 in rows:
-            sp = r0.get("strikePrice")
+            sp = r0.get("strikePrice"); 
             if sp is None: continue
             d = abs(float(sp)-underlying)
             if d < best: best = d; atm_row = r0
@@ -145,7 +144,6 @@ def fetch_iv_spot_from_nse(symbol: str, horizon_days: int, retries: int = 3, sle
         if ce_iv is not None and pe_iv is not None: iv = (float(ce_iv)+float(pe_iv))/200.0
         elif ce_iv is not None: iv = float(ce_iv)/100.0
         elif pe_iv is not None: iv = float(pe_iv)/100.0
-
         return underlying, iv, chosen_exp
     except Exception:
         return None, None, None
@@ -155,135 +153,288 @@ def fetch_iv_spot_from_nse(symbol: str, horizon_days: int, retries: int = 3, sle
 LOT_CSV_URL = "https://nsearchives.nseindia.com/content/fo/fo_mktlots.csv"
 
 def fetch_lot_sizes() -> Dict[str, int]:
-    """Return {SYMBOL: lot} from NSE's fo_mktlots.csv; fallback empty dict."""
     try:
         sess = _nse_session()
         resp = sess.get(LOT_CSV_URL, headers=NSE_HEADERS, timeout=12)
         if resp.status_code != 200:
-            time.sleep(1.0)
-            sess = _nse_session()
+            time.sleep(1.0); sess = _nse_session()
             resp = sess.get(LOT_CSV_URL, headers=NSE_HEADERS, timeout=12)
-        if resp.status_code != 200:
-            return {}
+        if resp.status_code != 200: return {}
         rdr = csv.DictReader(io.StringIO(resp.text))
         out: Dict[str,int] = {}
         for row in rdr:
             sym = (row.get("SYMBOL") or row.get("Symbol") or row.get("Underlying") or "").strip().upper()
             lot = (row.get("MARKET LOT") or row.get("MarketLot") or row.get("LOT_SIZE") or
                    row.get("Lot Size") or row.get("Market Lot") or "")
-            if not sym or not lot:
-                continue
-            try:
-                out[sym] = int(float(lot))
-            except:
-                continue
+            if not sym or not lot: continue
+            try: out[sym] = int(float(lot))
+            except: pass
         return out
     except Exception:
         return {}
 
-# ------------------------------ Strategy Engine ------------------------------
+# ------------------------------ Helpers --------------------------------------
 
-@dataclass
-class StrategyInputs:
-    spot: float
-    iv: float
-    lot: int
-    days: int
-    r: float
-    q: float
-    sigma_ic: float
-    sigma_bps: float
-    sigma_ls: float
-    width_pct_ic: float
-    width_pct_bps: float
+def stride_and_em(spot: float, iv: float, days: int):
+    t = max(1e-9, days/365.0)
+    em = spot * iv * math.sqrt(t)  # 1σ move
+    stride = max(1, suggest_stride(spot))
+    return t, em, stride
 
-@dataclass
-class BuiltExtras:
-    S: float; iv: float; t: float; em: float
-    ic_width: int; bps_width: int
+def price_call(S,K,t,r,iv,q): return bs_price(S,K,t,r,iv,q,"call")
+def price_put (S,K,t,r,iv,q): return bs_price(S,K,t,r,iv,q,"put")
 
-def build_strategies(inp: StrategyInputs
-                     ) -> Tuple[StrategyResult, StrategyResult, StrategyResult, StrategyResult, BuiltExtras]:
-    S = max(1e-9, float(inp.spot))
-    iv = max(0.01, min(float(inp.iv), 3.0))
-    t = max(1e-9, inp.days/365.0)
+def pop_between(S, em, lo, hi):
+    # Approximate: ST ~ Normal(mean=S, sd=em)
+    if lo is None and hi is None: return None
+    def z(x): return (x - S) / (em if em>1e-9 else 1.0)
+    lo_z = -10 if lo is None else z(lo)
+    hi_z =  10 if hi is None else z(hi)
+    return max(0.0, min(1.0, norm_cdf(hi_z) - norm_cdf(lo_z)))
 
-    em = S * iv * math.sqrt(t)  # 1σ move
-    stride = max(1, suggest_stride(S))
-    width_ic = max(stride*2, round_to_stride(inp.width_pct_ic*S, stride))
-    width_bps = max(stride*2, round_to_stride(inp.width_pct_bps*S, stride))
+# --------------------------- Strategy Generators -----------------------------
 
-    # Iron Condor
-    sc = max(round_to_stride(S + inp.sigma_ic*em, stride), stride)
-    lc = max(sc + width_ic, stride)
-    sp = max(round_to_stride(S - inp.sigma_ic*em, stride), stride)
-    lp = max(sp - width_ic, stride)
+def width_from_pct(S, pct, stride):
+    return max(stride*2, round_to_stride(pct*S, stride))
 
-    sc_p = bs_price(S, sc, t, inp.r, iv, inp.q, "call")
-    lc_p = bs_price(S, lc, t, inp.r, iv, inp.q, "call")
-    sp_p = bs_price(S, sp, t, inp.r, iv, inp.q, "put")
-    lp_p = bs_price(S, lp, t, inp.r, iv, inp.q, "put")
+def mk_result(key,name,style,group,cd,beL,beH,maxP,maxL,roi,strikes,pop,notes):
+    return StratResult(key=key,name=name,style=style,group=group,
+                       credit_debit_sh=cd,be_low=beL,be_high=beH,
+                       max_profit_sh=maxP,max_loss_sh=maxL,roi=roi,
+                       strikes=strikes,pop=pop,notes=notes)
 
-    ic_credit = max(0.0, (sc_p-lc_p) + (sp_p-lp_p))
-    ic_width_calc = max(lc - sc, sp - lp)
-    ic_risk = max(1e-9, ic_width_calc - ic_credit)
-    ic_roi = ic_credit / ic_risk
-    ic = StrategyResult("Iron Condor", "Sell premium", ic_credit, sp-ic_credit, sc+ic_credit,
-                        ic_credit, ic_risk, ic_roi,
-                        {"ShortPut": sp, "LongPut": lp, "ShortCall": sc, "LongCall": lc})
+def gen_all_strats(S, iv, days, r, q,
+                   sigma_ic, sigma_bps, sigma_ls,
+                   w_ic_pct, w_bps_pct,
+                   allow_naked: bool):
+    t, em, stride = stride_and_em(S, iv, days)
 
-    # Bull Put Spread
-    bps_sp = max(round_to_stride(S - inp.sigma_bps*em, stride), stride)
-    bps_lp = max(bps_sp - width_bps, stride)
-    bps_credit = max(0.0, bs_price(S, bps_sp, t, inp.r, iv, inp.q, "put") - bs_price(S, bps_lp, t, inp.r, iv, inp.q, "put"))
-    bps_width = bps_sp - bps_lp
-    bps_risk = max(1e-9, bps_width - bps_credit)
-    bps_roi = bps_credit / bps_risk
-    bps = StrategyResult("Bull Put Spread", "Sell premium", bps_credit, bps_sp-bps_credit, None,
-                         bps_credit, bps_risk, bps_roi, {"ShortPut": bps_sp, "LongPut": bps_lp})
+    results: List[StratResult] = []
 
-    # Long Strangle
-    ls_cK = max(round_to_stride(S + inp.sigma_ls*em, stride), stride)
-    ls_pK = max(round_to_stride(S - inp.sigma_ls*em, stride), stride)
-    ls_debit = bs_price(S, ls_cK, t, inp.r, iv, inp.q, "call") + bs_price(S, ls_pK, t, inp.r, iv, inp.q, "put")
-    ls = StrategyResult("Long Strangle", "Buy vol", -ls_debit, ls_pK-ls_debit, ls_cK+ls_debit,
-                        None, ls_debit, None, {"Put": ls_pK, "Call": ls_cK})
+    # ---------- Neutral: Short Iron Condor ----------
+    w_ic = width_from_pct(S, w_ic_pct, stride)
+    sc = round_to_stride(S + sigma_ic*em, stride); lc = sc + w_ic
+    sp = round_to_stride(S - sigma_ic*em, stride); lp = sp - w_ic
+    scP, lcP = price_call(S,sc,t,r,iv,q), price_call(S,lc,t,r,iv,q)
+    spP, lpP = price_put (S,sp,t,r,iv,q), price_put (S,lp,t,r,iv,q)
+    credit = (scP-lcP)+(spP-lpP); width = max(lc-sc, sp-lp)
+    risk = max(1e-9, width - credit); roi = credit/risk
+    beL, beH = sp-credit, sc+credit
+    results.append(mk_result("IC","Short Iron Condor","credit","Neutral",
+                             credit,beL,beH,credit,risk,roi,
+                             {"SP":sp,"LP":lp,"SC":sc,"LC":lc},
+                             pop_between(S,em,beL,beH), f"±{sigma_ic:.2f}σ; width≈{w_ic_pct*100:.1f}%"))
 
-    # Primary pick
-    if iv <= 0.20: primary = ls
-    elif iv >= 0.32: primary = bps
-    else: primary = ic
+    # ---------- Neutral: Short Iron Butterfly ----------
+    atm = round_to_stride(S, stride)
+    wing = w_ic  # reuse width
+    sc, lc = atm, atm+wing
+    sp, lp = atm, atm-wing
+    scP, lcP = price_call(S,sc,t,r,iv,q), price_call(S,lc,t,r,iv,q)
+    spP, lpP = price_put (S,sp,t,r,iv,q), price_put (S,lp,t,r,iv,q)
+    credit = (scP-lcP)+(spP-lpP); width = wing
+    risk = max(1e-9, width - credit); roi = credit/risk
+    beL, beH = atm-credit, atm+credit
+    results.append(mk_result("IB","Short Iron Butterfly","credit","Neutral",
+                             credit,beL,beH,credit,risk,roi,
+                             {"SP":sp,"LP":lp,"SC":sc,"LC":lc},
+                             pop_between(S,em,beL,beH),"ATM short straddle + wings"))
 
-    extras = BuiltExtras(S=S, iv=iv, t=t, em=em, ic_width=ic_width_calc, bps_width=bps_width)
-    return ic, bps, ls, primary, extras
+    # ---------- Neutral: Short Strangle / Short Straddle (naked) ----------
+    if allow_naked:
+        ss_putK  = round_to_stride(S - 1.1*em, stride)
+        ss_callK = round_to_stride(S + 1.1*em, stride)
+        cr = price_put(S,ss_putK,t,r,iv,q) + price_call(S,ss_callK,t,r,iv,q)
+        beL, beH = ss_putK - cr, ss_callK + cr
+        results.append(mk_result("SS","Short Strangle","credit","Neutral",
+                                 cr,beL,beH,None,None,None,
+                                 {"SP":ss_putK,"SC":ss_callK},
+                                 pop_between(S,em,beL,beH),"±1.1σ naked"))
+        sstrdK = atm; cr2 = price_put(S,sstrdK,t,r,iv,q) + price_call(S,sstrdK,t,r,iv,q)
+        beL2, beH2 = atm-cr2, atm+cr2
+        results.append(mk_result("SSTRD","Short Straddle","credit","Neutral",
+                                 cr2,beL2,beH2,None,None,None,
+                                 {"K":sstrdK}, pop_between(S,em,beL2,beH2),"ATM naked"))
 
-# ------------------------------ CSV + HTML -----------------------------------
+    # ---------- Long Straddle / Long Strangle ----------
+    kC = round_to_stride(S + sigma_ls*em, stride)
+    kP = round_to_stride(S - sigma_ls*em, stride)
+    debit_ls = price_call(S,kC,t,r,iv,q)+price_put(S,kP,t,r,iv,q)
+    results.append(mk_result("LS","Long Strangle","debit","Neutral",
+                             -debit_ls,kP-debit_ls,kC+debit_ls,None,debit_ls,None,
+                             {"KC":kC,"KP":kP}, 1 - pop_between(S,em,kP-debit_ls,kC+debit_ls),
+                             f"±{sigma_ls:.2f}σ long-vol"))
+    kA = atm
+    debit_lstrd = price_call(S,kA,t,r,iv,q)+price_put(S,kA,t,r,iv,q)
+    results.append(mk_result("LSTRD","Long Straddle","debit","Neutral",
+                             -debit_lstrd,kA-debit_lstrd,kA+debit_lstrd,None,debit_lstrd,None,
+                             {"K":kA}, 1 - pop_between(S,em,kA-debit_lstrd,kA+debit_lstrd),
+                             "ATM long-vol"))
 
-def write_csv(out_path: str, rows: List[Dict[str, str]]) -> None:
-    with open(out_path, "w", newline="", encoding="utf-8-sig") as f:  # BOM for Excel
-        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        w.writeheader(); w.writerows(rows)
+    # ---------- Bullish spreads ----------
+    w_b = width_from_pct(S, w_bps_pct, stride)
 
-# Use SAFE tokens instead of str.format braces to avoid conflicts with CSS/JS
+    # Bull Put Spread (credit)
+    sp2 = round_to_stride(S - 1.0*em, stride); lp2 = sp2 - w_b
+    cr_bps = price_put(S,sp2,t,r,iv,q) - price_put(S,lp2,t,r,iv,q)
+    risk = max(1e-9, (sp2-lp2) - cr_bps); roi = cr_bps/risk; be = sp2 - cr_bps
+    results.append(mk_result("BPS","Bull Put Spread","credit","Bullish",
+                             cr_bps,be,None,cr_bps,risk,roi,
+                             {"SP":sp2,"LP":lp2}, pop_between(S,em,be,None),"OTM put spread"))
+
+    # Bull Call Spread (debit)
+    lc1 = round_to_stride(S + 0.2*em, stride); sc1 = lc1 + w_b
+    debit_bcs = price_call(S,lc1,t,r,iv,q) - price_call(S,sc1,t,r,iv,q)
+    maxP = (sc1 - lc1) - debit_bcs; be = lc1 + debit_bcs
+    results.append(mk_result("BCS","Bull Call Spread","debit","Bullish",
+                             -debit_bcs,be,None,maxP,debit_bcs,maxP/max(debit_bcs,1e-9),
+                             {"LC":lc1,"SC":sc1}, 1 - pop_between(S,em,None,be),"OTM call spread"))
+
+    # Call Ratio Backspread (buy 2 OTM calls, sell 1 ATM call) – long convexity
+    k_sell = atm; k_buy = round_to_stride(S + 1.0*em, stride)
+    debit = 2*price_call(S,k_buy,t,r,iv,q) - price_call(S,k_sell,t,r,iv,q)
+    # breakeven high approximately: k_sell + |debit|
+    beH = k_sell + max(0.0,debit)
+    results.append(mk_result("CRB","Call Ratio Backspread","debit","Bullish",
+                             -debit,None,beH,None,max(0.0,debit),None,
+                             {"SellC":k_sell,"BuyC":k_buy,"Ratio":"1x2"},
+                             None,"ATM short 1, buy 2× OTM"))
+
+    # Long Synthetic Future (call - put @ ATM)
+    syn_debit = price_call(S,atm,t,r,iv,q) - price_put(S,atm,t,r,iv,q)
+    results.append(mk_result("LSYNF","Long Synthetic Future","other","Bullish",
+                             syn_debit,None,None,None,None,None,
+                             {"K":atm},None,"Long C, Short P (ATM)"))
+
+    # ---------- Bearish spreads ----------
+    # Bear Call Spread (credit)
+    sc2 = round_to_stride(S + 1.0*em, stride); lc2 = sc2 + w_b
+    cr_bcs2 = price_call(S,sc2,t,r,iv,q) - price_call(S,lc2,t,r,iv,q)
+    risk2 = max(1e-9, (lc2-sc2) - cr_bcs2); roi2 = cr_bcs2/risk2; be2 = sc2 + cr_bcs2
+    results.append(mk_result("BECS","Bear Call Spread","credit","Bearish",
+                             cr_bcs2,None,be2,cr_bcs2,risk2,roi2,
+                             {"SC":sc2,"LC":lc2}, 1 - pop_between(S,em,None,be2),"OTM call spread"))
+
+    # Bear Put Spread (debit)
+    sp3 = round_to_stride(S - 0.2*em, stride); lp3 = sp3 - w_b
+    debit_beps = price_put(S,sp3,t,r,iv,q) - price_put(S,lp3,t,r,iv,q)
+    maxP3 = (sp3 - lp3) - debit_beps; be3 = sp3 - debit_beps
+    results.append(mk_result("BEPS","Bear Put Spread","debit","Bearish",
+                             -debit_beps,be3,None,maxP3,debit_beps,maxP3/max(debit_beps,1e-9),
+                             {"SP":sp3,"LP":lp3}, pop_between(S,em,None,be3),"OTM put spread"))
+
+    # Put Ratio Backspread (buy 2 OTM puts, sell 1 ATM put)
+    k_sellp = atm; k_buyp = round_to_stride(S - 1.0*em, stride)
+    debitp = 2*price_put(S,k_buyp,t,r,iv,q) - price_put(S,k_sellp,t,r,iv,q)
+    beL = k_sellp - max(0.0,debitp)
+    results.append(mk_result("PRB","Put Ratio Backspread","debit","Bearish",
+                             -debitp,beL,None,None,max(0.0,debitp),None,
+                             {"SellP":k_sellp,"BuyP":k_buyp,"Ratio":"1x2"},None,"ATM short 1, buy 2× OTM"))
+
+    # Short Synthetic Future (short call + long put @ ATM)
+    syn_credit = price_call(S,atm,t,r,iv,q) - price_put(S,atm,t,r,iv,q)
+    results.append(mk_result("SSYNF","Short Synthetic Future","other","Bearish",
+                             -syn_credit,None,None,None,None,None,
+                             {"K":atm},None,"Short C, Long P (ATM)"))
+
+    # ---------- Naked directional (optional) ----------
+    if allow_naked:
+        cr_put  = price_put (S, round_to_stride(S-1.0*em,stride), t,r,iv,q)
+        cr_call = price_call(S, round_to_stride(S+1.0*em,stride), t,r,iv,q)
+        results.append(mk_result("SELL_PUT","Sell Put (naked)","credit","Bullish",
+                                 cr_put, round_to_stride(S-1.0*em,stride)-cr_put, None, cr_put, None, None,
+                                 {"SP":round_to_stride(S-1.0*em,stride)}, None,""))
+        results.append(mk_result("SELL_CALL","Sell Call (naked)","credit","Bearish",
+                                 cr_call, None, round_to_stride(S+1.0*em,stride)+cr_call, cr_call, None, None,
+                                 {"SC":round_to_stride(S+1.0*em,stride)}, None,""))
+
+    # ---------- Butterflies / Condors (long debit) ----------
+    # Bull Butterfly (calls): K1 < K2 < K3
+    k2 = round_to_stride(S + 0.5*em, stride); k1 = k2 - w_b; k3 = k2 + w_b
+    debit_bfly = price_call(S,k1,t,r,iv,q) - 2*price_call(S,k2,t,r,iv,q) + price_call(S,k3,t,r,iv,q)
+    beL = k1 + debit_bfly; beH = k3 - debit_bfly; maxP = w_b - debit_bfly
+    results.append(mk_result("BULL_BFLY","Bull Butterfly (calls)","debit","Bullish",
+                             -debit_bfly,beL,beH,maxP,debit_bfly,maxP/max(debit_bfly,1e-9),
+                             {"K1":k1,"K2":k2,"K3":k3}, pop_between(S,em,beL,beH),"1-2-1"))
+
+    # Bear Butterfly (puts)
+    k2p = round_to_stride(S - 0.5*em, stride); k1p = k2p - w_b; k3p = k2p + w_b
+    debit_bflyp = price_put(S,k1p,t,r,iv,q) - 2*price_put(S,k2p,t,r,iv,q) + price_put(S,k3p,t,r,iv,q)
+    beL = k1p + debit_bflyp; beH = k3p - debit_bflyp; maxP = w_b - debit_bflyp
+    results.append(mk_result("BEAR_BFLY","Bear Butterfly (puts)","debit","Bearish",
+                             -debit_bflyp,beL,beH,maxP,debit_bflyp,maxP/max(debit_bflyp,1e-9),
+                             {"K1":k1p,"K2":k2p,"K3":k3p}, pop_between(S,em,beL,beH),"1-2-1"))
+
+    # Bull Condor (calls) – debit
+    kL1 = round_to_stride(S + 0.2*em, stride); kS1 = kL1 + w_b
+    kS2 = kS1 + w_b; kL2 = kS2 + w_b
+    debit_cnd = (price_call(S,kL1,t,r,iv,q) - price_call(S,kS1,t,r,iv,q)) \
+              + (price_call(S,kL2,t,r,iv,q) - price_call(S,kS2,t,r,iv,q))
+    # approx: maxP occurs between short strikes: (kS2-kS1) - debit
+    maxP = (kS2 - kS1) - debit_cnd
+    results.append(mk_result("BULL_CONDOR","Bull Condor (calls)","debit","Bullish",
+                             -debit_cnd,None,None,maxP,debit_cnd,None,
+                             {"L1":kL1,"S1":kS1,"S2":kS2,"L2":kL2},None,"two call spreads"))
+
+    # Bear Condor (puts) – debit
+    pL1 = round_to_stride(S - 0.2*em, stride); pS1 = pL1 - w_b
+    pS2 = pS1 - w_b; pL2 = pS2 - w_b
+    debit_cndp = (price_put(S,pL1,t,r,iv,q) - price_put(S,pS1,t,r,iv,q)) \
+               + (price_put(S,pL2,t,r,iv,q) - price_put(S,pS2,t,r,iv,q))
+    maxPp = (pS1 - pS2) - debit_cndp
+    results.append(mk_result("BEAR_CONDOR","Bear Condor (puts)","debit","Bearish",
+                             -debit_cndp,None,None,maxPp,debit_cndp,None,
+                             {"L1":pL1,"S1":pS1,"S2":pS2,"L2":pL2},None,"two put spreads"))
+
+    # ---------- Strip / Strap ----------
+    # Strip: long 2P + 1C at ATM (bearish vol)
+    strip_debit = 2*price_put(S,atm,t,r,iv,q) + price_call(S,atm,t,r,iv,q)
+    results.append(mk_result("STRIP","Strip (2P+1C @ATM)","debit","Other",
+                             -strip_debit,None,None,None,strip_debit,None,
+                             {"K":atm},None,"bearish long-vol tilt"))
+    # Strap: long 2C + 1P at ATM (bullish vol)
+    strap_debit = 2*price_call(S,atm,t,r,iv,q) + price_put(S,atm,t,r,iv,q)
+    results.append(mk_result("STRAP","Strap (2C+1P @ATM)","debit","Other",
+                             -strap_debit,None,None,None,strap_debit,None,
+                             {"K":atm},None,"bullish long-vol tilt"))
+
+    return results, em, stride
+
+# ------------------------------ Ranking --------------------------------------
+
+def score_strategy(res: StratResult, S: float, em: float) -> float:
+    """Composite score: POP (0..1), ROI scaled, and BE distance / risk sanity."""
+    pop = res.pop if res.pop is not None else 0.5
+    roi = res.roi if res.roi is not None else 0.0
+    # Breakeven distance normalized by σ
+    be_span = 0.0
+    if res.be_low is not None and res.be_high is not None:
+        be_span = max(0.0, (res.be_high - res.be_low) / (2*em + 1e-9))
+    elif res.be_low is not None:
+        be_span = max(0.0, (S - res.be_low) / (2*em + 1e-9))
+    elif res.be_high is not None:
+        be_span = max(0.0, (res.be_high - S) / (2*em + 1e-9))
+
+    # Cap unlimited risk strategies by giving small base weight (they’re off by default anyway)
+    uncapped_penalty = 0.15 if (res.max_loss_sh is None and res.style=="credit") else 0.0
+
+    # Weighted sum
+    return 0.55*pop + 0.30*max(0.0, min(roi, 2.0)) + 0.20*min(be_span,1.0) - uncapped_penalty
+
+# ------------------------------ HTML (Top picks) -----------------------------
+
 HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>IV Agent</title>
+<title>IV Agent – Top Strategies</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
-  :root{
-    --bg:#070b16; --card:#0f1629; --panel:#0b1222;
-    --txt:#e8ecf6; --muted:#a4afc6; --line:#1b2a4a; --accent:#7aa2f7;
-    --ok:#34d399; --warn:#f59e0b; --bad:#ef4444;
-    --ic:#22d3ee; --bps:#a7f3d0; --ls:#f9a8d4;
-  }
-  *{box-sizing:border-box}
-  body{margin:0;background:
-    radial-gradient(1000px 600px at 10% -10%, #1c2550 0%, transparent 60%),
-    radial-gradient(900px 600px at 110% 10%, #1d3a3f 0%, transparent 55%),
-    var(--bg);
-    color:var(--txt); font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Ubuntu,Arial,sans-serif}
+  :root{--bg:#070b16;--card:#0f1629;--panel:#0b1222;--txt:#e8ecf6;--muted:#a4afc6;--line:#1b2a4a;--accent:#7aa2f7;
+        --ic:#22d3ee;--bps:#a7f3d0;--ls:#f9a8d4;--c1:#60a5fa;--c2:#34d399;--c3:#fbbf24;--c4:#f472b6;--c5:#22d3ee;}
+  *{box-sizing:border-box} body{margin:0;background:radial-gradient(1000px 600px at 10% -10%,#1c2550 0%,transparent 60%),
+  radial-gradient(900px 600px at 110% 10%,#1d3a3f 0%,transparent 55%),var(--bg);color:var(--txt);
+  font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Ubuntu,Arial,sans-serif}
   .wrap{max-width:1180px;margin:0 auto;padding:24px}
   h1{margin:0 0 4px 0;font-size:28px;letter-spacing:.3px}
   .meta{color:var(--muted);margin-bottom:18px}
@@ -291,98 +442,56 @@ HTML = r"""<!doctype html>
   .search{flex:1;max-width:420px;background:#0b1427;border:1px solid #1d2a49;color:var(--txt);
           border-radius:12px;padding:10px 12px;outline:none}
   .btn{background:var(--accent);color:#fff;border:none;border-radius:12px;padding:10px 14px;cursor:pointer;text-decoration:none}
-  .btn.secondary{background:#203055;color:#dbe4ff}
   .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:14px}
-  .card{background:linear-gradient(180deg,#111b33 0%,#0d1428 100%);border:1px solid #1a2747;
-        border-radius:16px;padding:14px;cursor:pointer;transition:transform .12s ease, border-color .12s}
+  .card{background:linear-gradient(180deg,#111b33 0%,#0d1428 100%);border:1px solid #1a2747;border-radius:16px;padding:14px;
+        cursor:pointer;transition:transform .12s ease,border-color .12s}
   .card:hover{transform:translateY(-2px);border-color:#2a3a6a}
   .sym{font-weight:700;font-size:18px;letter-spacing:.4px}
   .row{display:flex;justify-content:space-between;margin-top:8px;color:var(--muted)}
-  .pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;margin-top:10px}
-  .pill.sell{background:#173225;color:#8bffa9}
-  .pill.buy{background:#2d1f2d;color:#ff9bd1}
-  .detail{
-    position:fixed;inset:0;background:rgba(5,8,15,.65);
-    display:none;align-items:flex-start;justify-content:center;padding:32px 16px;backdrop-filter:blur(4px)
-  }
+  .pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;margin-top:10px;background:#173225;color:#8bffa9}
+  .detail{position:fixed;inset:0;background:rgba(5,8,15,.65);display:none;align-items:flex-start;justify-content:center;
+          padding:32px 16px;backdrop-filter:blur(4px)}
   .panel{width:min(1100px,96vw);max-height:92vh;overflow:auto;background:var(--panel);border:1px solid #1c294b;border-radius:18px;padding:20px}
   .panelhead{display:flex;gap:8px;align-items:center;justify-content:space-between;margin-bottom:12px}
-  .title{font-size:22px;font-weight:700}
-  .sub{color:var(--muted)}
-  .tag{padding:2px 8px;border-radius:999px;background:#1c2747;color:#c5d0e8;font-size:12px;margin-left:6px}
-  .close{background:#25365e;border:1px solid #334876;color:#dbe4ff;border-radius:10px;padding:8px 10px;cursor:pointer}
-  .cols{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .title{font-size:22px;font-weight:700}.sub{color:var(--muted)}.close{background:#25365e;border:1px solid #334876;color:#dbe4ff;border-radius:10px;padding:8px 10px;cursor:pointer}
+  .cols{display:grid;grid-template-columns:1.3fr .7fr;gap:16px}@media (max-width:900px){.cols{grid-template-columns:1fr}}
   .box{background:#0e1933;border:1px solid #1c2a51;border-radius:14px;padding:12px}
-  .box h3{margin:0 0 8px 0;font-size:16px}
-  .grid2{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
-  .row2{display:flex;justify-content:space-between;border-bottom:1px dashed #1c2a51;padding:6px 0}
   canvas{width:100%;height:360px;background:#0b1427;border:1px solid #1b2a4a;border-radius:14px}
   .legend{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 0}
   .chip{display:flex;align-items:center;gap:6px;background:#162243;border:1px solid #233463;border-radius:999px;padding:6px 10px;cursor:pointer}
-  .dot{width:10px;height:10px;border-radius:50%}
-  .dot.ic{background:var(--ic)} .dot.bps{background:var(--bps)} .dot.ls{background:var(--ls)}
-  .chip.active{outline:2px solid #2f4aa8}
-  .range{display:flex;gap:8px;margin-top:6px}
-  .range .chip{background:#14203f}
-  .muted{color:var(--muted)}
-  @media (max-width:900px){ .cols{grid-template-columns:1fr} }
+  .chip.active{outline:2px solid #2f4aa8}.dot{width:10px;height:10px;border-radius:50%}
+  .tab{display:inline-block;margin:0 8px 8px 0;padding:6px 10px;border-radius:999px;background:#14203f;border:1px solid #233463;cursor:pointer}
+  .tab.active{outline:2px solid #2f4aa8}
+  table{width:100%;border-collapse:collapse;font-size:14px;margin-top:8px}
+  th,td{padding:8px;border-bottom:1px solid #1e2846;text-align:left}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>IV Agent</h1>
-  <div class="meta">Generated: __GENERATED__ · Horizon: __DAYS__ days · Source: NSE · Lot P&L assumes <b>1 lot</b></div>
-  <div class="toolbar">
-    <input id="q" class="search" placeholder="Search symbol…" />
-    <a class="btn" href="__CSV_NAME__" download>Download CSV</a>
-  </div>
-
+  <h1>IV Agent – Top Strategies</h1>
+  <div class="meta">Generated: __GENERATED__ · Horizon: __DAYS__ days · Lots=1 · Data: NSE · <a class="btn" href="__CSV_NAME__" download>CSV</a></div>
+  <div class="toolbar"><input id="q" class="search" placeholder="Search symbol…"/></div>
   <div id="cards" class="grid"></div>
 </div>
 
-<!-- Detail Overlay -->
-<div id="detail" class="detail" role="dialog" aria-modal="true">
+<div id="detail" class="detail">
   <div class="panel">
     <div class="panelhead">
-      <div>
-        <div class="title" id="d_sym">—</div>
-        <div class="sub" id="d_meta">—</div>
-      </div>
+      <div><div class="title" id="d_sym">—</div><div class="sub" id="d_meta">—</div></div>
       <button class="close" onclick="closeDetail()">Close</button>
     </div>
-
     <div class="cols">
       <div class="box">
-        <h3>Payoff @ Expiry (₹ per <b>lot</b>)</h3>
+        <div id="tabs"></div>
         <canvas id="chart" width="900" height="360"></canvas>
-        <div class="legend">
-          <div id="selIC"  class="chip"><span class="dot ic"></span>Iron Condor</div>
-          <div id="selBPS" class="chip"><span class="dot bps"></span>Bull Put Spread</div>
-          <div id="selLS"  class="chip"><span class="dot ls"></span>Long Strangle</div>
-        </div>
-        <div class="range">
-          <div id="r1"  class="chip">±1σ</div>
-          <div id="r15" class="chip">±1.5σ</div>
-          <div id="r2"  class="chip">±2σ</div>
-        </div>
-        <div class="muted" id="explain" style="margin-top:8px"></div>
+        <div class="legend" id="legend"></div>
       </div>
-
       <div class="box">
-        <h3>Strategy Details (per share & per 1 lot)</h3>
-        <div class="grid2">
-          <div>
-            <div class="row2"><span><b>Primary</b></span><span id="primName">—</span></div>
-            <div class="row2"><span>Action</span><span id="primAction">—</span></div>
-            <div class="row2"><span>Max P/L (₹/sh)</span><span id="primPLsh">—</span></div>
-            <div class="row2"><span>Max P/L (₹/lot)</span><span id="primPLlot">—</span></div>
-            <div class="row2"><span>Breakevens</span><span id="primBE">—</span></div>
-          </div>
-          <div id="legs"></div>
-        </div>
-        <div class="muted" style="margin-top:10px">
-          Pricing uses Black–Scholes (European) with continuous dividend yield. IV is annualized (decimal).
-        </div>
+        <div style="margin-bottom:6px;color:#cbd5e1"><b>Selected strategies</b> (per share / per lot)</div>
+        <table id="tbl"><thead>
+          <tr><th>Strategy</th><th>Credit/Debit</th><th>B/E</th><th>Max P/L</th><th>ROI%</th><th>POP%</th></tr>
+        </thead><tbody></tbody></table>
+        <div style="margin-top:10px"><span id="toggleAll" class="tab">Show all strategies</span></div>
       </div>
     </div>
   </div>
@@ -390,206 +499,177 @@ HTML = r"""<!doctype html>
 
 <script>
 const DATA = __DATA_JSON__;
-const GLOBAL_DAYS = __DAYS__;
-const CURRENCY = "₹";
+const TOPN = __TOPN__;
 
-// Build cards
 const cards = document.getElementById('cards');
-function pillClass(action){ return action.includes('Sell') ? 'pill sell' : 'pill buy'; }
-function card(sym, spot, iv, primary, i) {
-  const div = document.createElement('div');
-  div.className='card';
-  div.onclick=()=>openDetail(i);
-  div.innerHTML = `
-    <div class="sym">${sym}</div>
-    <div class="row"><span>Spot</span><span>₹${spot.toFixed(2)}</span></div>
-    <div class="row"><span>IV</span><span>${(iv*100).toFixed(1)}%</span></div>
-    <div class="${pillClass(primary.action)}">${primary.name} – ${primary.action}</div>
-  `;
-  return div;
-}
-DATA.forEach((d,i)=>cards.appendChild(card(d.symbol,d.spot,d.iv,d.primary,i)));
-
-// Search
-document.getElementById('q').addEventListener('input', e=>{
-  const t = e.target.value.toLowerCase();
-  Array.from(cards.children).forEach(c=>{
-    c.style.display = c.textContent.toLowerCase().includes(t) ? '' : 'none';
-  });
+const q = document.getElementById('q');
+q.addEventListener('input', e=>{
+  const t=e.target.value.toLowerCase();
+  Array.from(cards.children).forEach(c=>{c.style.display=c.textContent.toLowerCase().includes(t)?'':''})
 });
 
-// Detail logic
-const detail = document.getElementById('detail');
-const d_sym = document.getElementById('d_sym');
-const d_meta = document.getElementById('d_meta');
-const primName = document.getElementById('primName');
-const primAction = document.getElementById('primAction');
-const primPLsh = document.getElementById('primPLsh');
-const primPLlot = document.getElementById('primPLlot');
-const primBE = document.getElementById('primBE');
-const legs = document.getElementById('legs');
-const explain = document.getElementById('explain');
+function pill(s){const d=document.createElement('div');d.className='pill';d.textContent=s;return d;}
+DATA.forEach((d,i)=>{
+  const card=document.createElement('div');card.className='card';card.onclick=()=>openDetail(i);
+  card.innerHTML=`<div class="sym">${d.symbol}</div>
+  <div class="row"><span>Spot</span><span>₹${d.spot.toFixed(2)}</span></div>
+  <div class="row"><span>IV</span><span>${(d.iv*100).toFixed(1)}%</span></div>`;
+  const p=pill(d.top.map(x=>x.name).join(' · ')); card.appendChild(p); cards.appendChild(card);
+});
 
-let CUR = null;
-let showIC=true, showBPS=false, showLS=false;
-let sigMult = 1.0;
+const detail=document.getElementById('detail');
+const d_sym=document.getElementById('d_sym'); const d_meta=document.getElementById('d_meta');
+const tbl=document.querySelector('#tbl tbody'); const legend=document.getElementById('legend'); const tabs=document.getElementById('tabs');
+const toggleAll=document.getElementById('toggleAll');
+let CUR=null, SHOW_ALL=false, sel=[];
 
-function fmt(x){ return (x===null||x===undefined) ? '—' : (typeof x==='number'? x.toFixed(2): x); }
 function openDetail(i){
-  CUR = DATA[i];
-  d_sym.textContent = CUR.symbol;
-  d_meta.textContent = `Expiry: ${CUR.expiry || '—'} · Lot: ${CUR.lot} · Spot: ₹${CUR.spot.toFixed(2)} · IV: ${(CUR.iv*100).toFixed(1)}%`;
-  primName.textContent = CUR.primary.name;
-  primAction.textContent = CUR.primary.action;
-  primPLsh.textContent = `${CUR.primary.max_profit_sh} / ${CUR.primary.max_loss_sh}`;
-  primPLlot.textContent = `${CUR.primary.max_profit_lot} / ${CUR.primary.max_loss_lot}`;
-  primBE.textContent = `${CUR.primary.be_low?.toFixed(2) ?? '—'}  /  ${CUR.primary.be_high?.toFixed(2) ?? '—'}`;
-
-  // Legs summary
-  legs.innerHTML = `
-    <div>
-      <div class="row2"><span><b>IC</b> Short Put</span><span>${CUR.ic.sp}</span></div>
-      <div class="row2"><span>IC Long Put</span><span>${CUR.ic.lp}</span></div>
-      <div class="row2"><span>IC Short Call</span><span>${CUR.ic.sc}</span></div>
-      <div class="row2"><span>IC Long Call</span><span>${CUR.ic.lc}</span></div>
-      <div class="row2"><span>IC Credit (₹/sh · /lot)</span><span>${CUR.ic.credit_sh.toFixed(2)} · ${CUR.ic.credit_lot.toFixed(2)}</span></div>
-    </div>
-    <div>
-      <div class="row2"><span><b>BPS</b> Short Put</span><span>${CUR.bps.sp}</span></div>
-      <div class="row2"><span>BPS Long Put</span><span>${CUR.bps.lp}</span></div>
-      <div class="row2"><span>BPS Credit (₹/sh · /lot)</span><span>${CUR.bps.credit_sh.toFixed(2)} · ${CUR.bps.credit_lot.toFixed(2)}</span></div>
-      <div class="row2"><span><b>LS</b> Put</span><span>${CUR.ls.kp}</span></div>
-      <div class="row2"><span>LS Call</span><span>${CUR.ls.kc}</span></div>
-      <div class="row2"><span>LS Cost (₹/sh · /lot)</span><span>${CUR.ls.debit_sh.toFixed(2)} · ${CUR.ls.debit_lot.toFixed(2)}</span></div>
-    </div>
-  `;
-
-  // Default toggles: primary only
-  showIC = CUR.primary.name==='Iron Condor';
-  showBPS= CUR.primary.name==='Bull Put Spread';
-  showLS = CUR.primary.name==='Long Strangle';
-  sigMult = 1.0;
-  syncToggles();
-  draw();
+  CUR=DATA[i]; SHOW_ALL=false;
+  d_sym.textContent=CUR.symbol;
+  d_meta.textContent=`Expiry: ${CUR.expiry||'—'} · Lot: ${CUR.lot} · Spot: ₹${CUR.spot.toFixed(2)} · IV ${(CUR.iv*100).toFixed(1)}%`;
+  sel=CUR.top.map(x=>x.key);
+  renderTabs(); renderLegend(); renderTable(); draw();
   detail.style.display='flex';
 }
 function closeDetail(){ detail.style.display='none'; }
 
-// Toggle chips
-function syncToggles(){
-  const t=(id,on)=>{ const el=document.getElementById(id); el.classList.toggle('active', on); }
-  t('selIC',showIC); t('selBPS',showBPS); t('selLS',showLS);
-  t('r1',sigMult===1.0); t('r15',sigMult===1.5); t('r2',sigMult===2.0);
+function renderTabs(){
+  tabs.innerHTML='';
+  ['±1σ','±1.5σ','±2σ'].forEach((t,idx)=>{
+    const span=document.createElement('span');span.className='tab'+(idx==0?' active':'');span.textContent=t;span.dataset.m=[1,1.5,2][idx];
+    span.onclick=(e)=>{Array.from(tabs.children).forEach(c=>c.classList.remove('active')); e.target.classList.add('active'); draw(parseFloat(e.target.dataset.m));}
+    tabs.appendChild(span);
+  });
 }
-document.getElementById('selIC').onclick = ()=>{ showIC=!showIC; syncToggles(); draw(); }
-document.getElementById('selBPS').onclick= ()=>{ showBPS=!showBPS; syncToggles(); draw(); }
-document.getElementById('selLS').onclick = ()=>{ showLS=!showLS; syncToggles(); draw(); }
-document.getElementById('r1').onclick  = ()=>{ sigMult=1.0; syncToggles(); draw(); }
-document.getElementById('r15').onclick = ()=>{ sigMult=1.5; syncToggles(); draw(); }
-document.getElementById('r2').onclick  = ()=>{ sigMult=2.0; syncToggles(); draw(); }
-
-// Payoff (per LOT)
-function payoffIC(ST,d){
-  const L = d.lot, credit = d.ic.credit_sh;
-  const sp=d.ic.sp, lp=d.ic.lp, sc=d.ic.sc, lc=d.ic.lc;
-  let callLoss = 0;
-  if (ST>sc && ST<lc) callLoss = ST - sc;
-  else if (ST>=lc)    callLoss = (lc - sc);
-  let putLoss = 0;
-  if (ST<sp && ST>lp) putLoss = sp - ST;
-  else if (ST<=lp)    putLoss = (sp - lp);
-  const perShare = credit - callLoss - putLoss;
-  return perShare * L;
-}
-function payoffBPS(ST,d){
-  const L=d.lot, credit=d.bps.credit_sh, sp=d.bps.sp, lp=d.bps.lp, width=(sp-lp);
-  let loss = 0;
-  if (ST<sp && ST>lp) loss = sp - ST;
-  else if (ST<=lp)    loss = width;
-  return (credit - loss)*L;
-}
-function payoffLS(ST,d){
-  const L=d.lot, debit=d.ls.debit_sh, kp=d.ls.kp, kc=d.ls.kc;
-  const put  = Math.max(0, kp - ST);
-  const call = Math.max(0, ST - kc);
-  return (put + call - debit) * L;
+function colorFor(i){return ['#60a5fa','#34d399','#fbbf24','#f472b6','#22d3ee','#e5e7eb'][i%6];}
+function renderLegend(){
+  legend.innerHTML='';
+  const arr = SHOW_ALL ? CUR.all : CUR.top;
+  arr.forEach((s,i)=>{
+    const chip=document.createElement('span');chip.className='chip'+(sel.includes(s.key)?' active':'');
+    chip.innerHTML=`<span class="dot" style="background:${colorFor(i)}"></span>${s.name}`;
+    chip.onclick=()=>{ if(sel.includes(s.key)) sel=sel.filter(k=>k!==s.key); else sel.push(s.key); draw(); renderTable(); chip.classList.toggle('active'); };
+    legend.appendChild(chip);
+  });
+  toggleAll.textContent = SHOW_ALL ? 'Show only top' : 'Show all strategies';
+  toggleAll.onclick=()=>{ SHOW_ALL=!SHOW_ALL; renderLegend(); renderTable(); draw(); };
 }
 
-// Drawing
-function draw(){
-  const c = document.getElementById('chart');
-  const ctx = c.getContext('2d');
-  ctx.clearRect(0,0,c.width,c.height);
+function fmt(x){return x==null?'—':(typeof x==='number'?x.toFixed(2):x);}
+function renderTable(){
+  tbl.innerHTML=''; const arr = SHOW_ALL ? CUR.all : CUR.top;
+  arr.filter(s=>sel.includes(s.key)).forEach(s=>{
+    const tr=document.createElement('tr');
+    const cd = (s.credit_debit_sh>=0?'+':'')+s.credit_debit_sh.toFixed(2)+` / `+((s.credit_debit_sh)*CUR.lot).toFixed(2);
+    const be = (s.be_low? s.be_low.toFixed(2):'—')+' / '+(s.be_high? s.be_high.toFixed(2):'—');
+    const mpl = (s.max_profit_sh is null? 'Uncapped' : s.max_profit_sh.toFixed(2)) + ' / ' + (s.max_profit_sh is null? 'Uncapped' : (s.max_profit_sh*CUR.lot).toFixed(2));
+  });
+  arr.filter(s=>sel.includes(s.key)).forEach(s=>{
+    const tr=document.createElement('tr');
+    const cd = (s.credit_debit_sh>=0?'+':'')+s.credit_debit_sh.toFixed(2)+' / '+((s.credit_debit_sh)*CUR.lot).toFixed(2);
+    const be = (s.be_low!=null? s.be_low.toFixed(2):'—')+' / '+(s.be_high!=null? s.be_high.toFixed(2):'—');
+    const maxp = (s.max_profit_sh==null? 'Uncapped' : s.max_profit_sh.toFixed(2))+' / '+(s.max_profit_sh==null? 'Uncapped' : (s.max_profit_sh*CUR.lot).toFixed(2));
+    const maxl = (s.max_loss_sh==null? '—' : s.max_loss_sh.toFixed(2))+' / '+(s.max_loss_sh==null? '—' : (s.max_loss_sh*CUR.lot).toFixed(2));
+    const roi = s.roi==null? '—' : (s.roi*100).toFixed(1);
+    const pop = s.pop==null? '—' : (s.pop*100).toFixed(1);
+    tr.innerHTML=`<td>${s.name}</td><td>${cd}</td><td>${be}</td><td>${maxp} · ${maxl}</td><td>${roi}</td><td>${pop}</td>`;
+    tbl.appendChild(tr);
+  });
+}
 
-  const d = CUR;
-  const em = d.em;
-  const S = d.spot;
-  const range = sigMult * em;
-  const xMin = Math.max(0, S - range*1.05);
-  const xMax = S + range*1.05;
-
-  // Build series
-  const N=350, xs=[], ysIC=[], ysBPS=[], ysLS=[];
-  for(let i=0;i<=N;i++){
-    const ST = xMin + (xMax-xMin)*i/N;
-    xs.push(ST);
-    if(showIC)  ysIC.push(payoffIC(ST,d));
-    if(showBPS) ysBPS.push(payoffBPS(ST,d));
-    if(showLS)  ysLS.push(payoffLS(ST,d));
-  }
-  let yMin=0, yMax=0;
-  const allY=[...ysIC,...ysBPS,...ysLS];
-  if(allY.length){ yMin=Math.min(...allY); yMax=Math.max(...allY); }
-  if(yMin===yMax){ yMin-=1; yMax+=1; }
-  const pad = (yMax - yMin)*0.12; yMin-=pad; yMax+=pad;
-
-  // helpers
-  const X= x=> ( (x-xMin)/(xMax-xMin) )*(c.width-60) + 40;
-  const Y= y=> c.height-30 - ((y - yMin)/(yMax - yMin))*(c.height-60);
-
-  // axes
-  ctx.strokeStyle="#1b2a4a"; ctx.lineWidth=1;
-  ctx.strokeRect(40,20,c.width-80,c.height-50);
-  const xS = X(S); ctx.beginPath(); ctx.moveTo(xS,20); ctx.lineTo(xS,c.height-30); ctx.stroke();
-  const y0 = Y(0); ctx.beginPath(); ctx.moveTo(40,y0); ctx.lineTo(c.width-40,y0); ctx.stroke();
-
-  // labels
-  ctx.fillStyle="#a4afc6"; ctx.font="12px Segoe UI, Roboto, sans-serif";
-  ctx.fillText(`S=₹${S.toFixed(2)}`, xS+4, 30);
-  ctx.fillText("P/L (₹ per lot)", 46, 32);
-  ctx.fillText(`Price @ Expiry`, c.width-150, c.height-12);
-
-  // series
-  function plot(ys,color){
-    if(!ys.length) return;
-    ctx.beginPath();
-    ctx.strokeStyle=color; ctx.lineWidth=2;
-    for(let i=0;i<=N;i++){
-      const px=X(xs[i]), py=Y(ys[i]);
-      if(i===0) ctx.moveTo(px,py); else ctx.lineTo(px,py);
+function payoffLine(s, ST){
+  const L=CUR.lot;
+  const K=s.strikes||{};
+  function max(a,b){return a>b?a:b;} function min(a,b){return a<b?a:b;}
+  function callPay(k){return max(0, ST-k);} function putPay(k){return max(0, k-ST);}
+  // Map by key
+  switch(s.key){
+    case 'IC': {
+      const sp=K.SP, lp=K.LP, sc=K.SC, lc=K.LC; const credit=s.credit_debit_sh;
+      let callLoss=0; if (ST>sc && ST<lc) callLoss=ST-sc; else if (ST>=lc) callLoss=(lc-sc);
+      let putLoss=0;  if (ST<sp && ST>lp) putLoss=sp-ST; else if (ST<=lp) putLoss=(sp-lp);
+      return (credit - callLoss - putLoss)*L;
     }
-    ctx.stroke();
+    case 'IB': {
+      const sp=K.SP, lp=K.LP, sc=K.SC, lc=K.LC; const credit=s.credit_debit_sh;
+      let callLoss=0; if (ST>sc && ST<lc) callLoss=ST-sc; else if (ST>=lc) callLoss=(lc-sc);
+      let putLoss=0;  if (ST<sp && ST>lp) putLoss=sp-ST; else if (ST<=lp) putLoss=(sp-lp);
+      return (credit - callLoss - putLoss)*L;
+    }
+    case 'BPS': {
+      const sp=K.SP, lp=K.LP; const cr=s.credit_debit_sh;
+      let loss=0; if (ST<sp && ST>lp) loss=sp-ST; else if (ST<=lp) loss=(sp-lp);
+      return (cr - loss)*L;
+    }
+    case 'BCS': {
+      const lc=K.LC, sc=K.SC; const deb=-s.credit_debit_sh;
+      const val = min(max(0, ST-lc), sc-lc); return (val - deb)*L;
+    }
+    case 'BECS': {
+      const sc=K.SC, lc=K.LC; const cr=s.credit_debit_sh;
+      let loss=0; if (ST>sc && ST<lc) loss=ST-sc; else if (ST>=lc) loss=(lc-sc);
+      return (cr - loss)*L;
+    }
+    case 'BEPS': {
+      const sp=K.SP, lp=K.LP; const deb=-s.credit_debit_sh;
+      const val = min(max(0, sp-ST), sp-lp); return (val - deb)*L;
+    }
+    case 'LSTRD': {
+      const K0=K.K; const deb=-s.credit_debit_sh;
+      return (callPay(K0)+putPay(K0) - deb)*L;
+    }
+    case 'LS': {
+      const kc=K.KC, kp=K.KP; const deb=-s.credit_debit_sh;
+      return (callPay(kc)+putPay(kp) - deb)*L;
+    }
+    case 'SSTRD': {
+      const K0=K.K; const cr=s.credit_debit_sh;
+      return (cr - callPay(K0) - putPay(K0))*L;
+    }
+    case 'SS': {
+      const sp=K.SP, sc=K.SC; const cr=s.credit_debit_sh;
+      return (cr - max(0,sp-ST) - max(0,ST-sc))*L;
+    }
+    case 'BULL_BFLY': {
+      const k1=K.K1,k2=K.K2,k3=K.K3; const deb=-s.credit_debit_sh;
+      const val = min(max(0,ST-k1),k2-k1) + min(max(0,ST-k2),k3-k2) - min(max(0,ST-k2),k3-k2);
+      // simpler: two call spreads centered; approximate peak at k2
+      const wing=k2-k1; const peak = max(0, wing - deb);
+      const tri = Math.max(0, wing - Math.abs(ST-k2))  # approx triangle
+    }
   }
-  plot(ysIC,  getComputedStyle(document.documentElement).getPropertyValue('--ic').trim());
-  plot(ysBPS, getComputedStyle(document.documentElement).getPropertyValue('--bps').trim());
-  plot(ysLS,  getComputedStyle(document.documentElement).getPropertyValue('--ls').trim());
-
-  explain.innerHTML = `Range: ₹${(S-range).toFixed(2)} – ₹${(S+range).toFixed(2)} (±${sigMult}σ ≈ ₹${(sigMult*em).toFixed(2)}) · Lot=${d.lot}`;
+  // Fallback simple triangle for butterflies/condors if not matched
+  return 0;
 }
+
+function draw(mult=1.0){
+  const c=document.getElementById('chart'); const ctx=c.getContext('2d'); ctx.clearRect(0,0,c.width,c.height);
+  const arr = (SHOW_ALL?CUR.all:CUR.top).filter(s=>sel.includes(s.key));
+  if(!arr.length){return;}
+  const S=CUR.spot, em=CUR.em, L=CUR.lot; const range=mult*em; const xMin=Math.max(0,S-range*1.1), xMax=S+range*1.1;
+  const N=360, xs=[], series=arr.map(()=>[]);
+  for(let i=0;i<=N;i++){
+    const ST = xMin + (xMax-xMin)*i/N; xs.push(ST);
+    arr.forEach((s,idx)=>{ series[idx].push(payoffLine(s,ST)); });
+  }
+  let yMin=0,yMax=0; series.forEach(a=>a.forEach(v=>{yMin=Math.min(yMin,v); yMax=Math.max(yMax,v)}));
+  if(yMin===yMax){yMin-=1;yMax+=1} const pad=(yMax-yMin)*0.12; yMin-=pad; yMax+=pad;
+  const X=x=>((x-xMin)/(xMax-xMin))*(c.width-60)+40; const Y=y=>c.height-30 - ((y-yMin)/(yMax-yMin))*(c.height-60);
+  ctx.strokeStyle="#1b2a4a"; ctx.strokeRect(40,20,c.width-80,c.height-50);
+  const xS=X(S); ctx.beginPath(); ctx.moveTo(xS,20); ctx.lineTo(xS,c.height-30); ctx.stroke(); const y0=Y(0); ctx.beginPath(); ctx.moveTo(40,y0); ctx.lineTo(c.width-40,y0); ctx.stroke();
+  ctx.fillStyle="#a4afc6"; ctx.font="12px Segoe UI, Roboto"; ctx.fillText(`S=₹${S.toFixed(2)}`, xS+4, 30);
+  arr.forEach((s,idx)=>{
+    const col=['#60a5fa','#34d399','#fbbf24','#f472b6','#22d3ee','#e5e7eb'][idx%6];
+    ctx.beginPath(); ctx.strokeStyle=col; ctx.lineWidth=2;
+    series[idx].forEach((v,i)=>{ const px=X(xs[i]), py=Y(v); if(i===0) ctx.moveTo(px,py); else ctx.lineTo(px,py); });
+    ctx.stroke();
+  });
+}
+
 </script>
 </body>
 </html>
 """
-
-def write_html(out_html: str, csv_name: str, days: int, js_rows: List[dict]) -> None:
-    # Safe token replacement (no str.format) to avoid brace conflicts
-    html = (HTML
-            .replace("__GENERATED__", dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-            .replace("__DAYS__", str(days))
-            .replace("__CSV_NAME__", os.path.basename(csv_name))
-            .replace("__DATA_JSON__", json.dumps(js_rows, ensure_ascii=False)))
-    with open(out_html, "w", encoding="utf-8") as f:
-        f.write(html)
 
 # ------------------------------- CSV helpers ---------------------------------
 
@@ -605,66 +685,57 @@ def read_csv_map(path: str, key_col: str, val_col: str) -> Dict[str, float]:
                 except: pass
     return out
 
+def write_csv(out_path: str, rows: List[Dict[str, str]]) -> None:
+    with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader(); w.writerows(rows)
+
 # ------------------------------------ CLI ------------------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="IV Agent – NSE live IV, CSV + Website (cards + detail + payoff)")
-    ap.add_argument("--tickers", required=True, type=str, help="Comma-separated NSE symbols")
-    ap.add_argument("--days", type=int, default=30, help="Horizon in days")
+    ap = argparse.ArgumentParser(description="IV Agent – Multi-strategy (NSE) with website of top picks")
+    ap.add_argument("--tickers", required=True, type=str)
+    ap.add_argument("--days", type=int, default=30)
     ap.add_argument("--risk_free", type=float, default=0.07)
     ap.add_argument("--yield_div", type=float, default=0.00)
-    # sigma + widths
     ap.add_argument("--sigma_ic", type=float, default=1.2)
     ap.add_argument("--sigma_bps", type=float, default=1.0)
     ap.add_argument("--sigma_ls", type=float, default=1.0)
     ap.add_argument("--width_pct_ic", type=float, default=0.02)
     ap.add_argument("--width_pct_bps", type=float, default=0.02)
-    # data sources
     ap.add_argument("--default_iv", type=float, default=0.25)
     ap.add_argument("--iv_csv", type=str, default="")
     ap.add_argument("--spot_csv", type=str, default="")
     ap.add_argument("--live_iv", action="store_true")
     ap.add_argument("--use_yfinance_fallback", action="store_true")
-    # outputs
+    ap.add_argument("--allow_naked", action="store_true")
+    ap.add_argument("--top_n", type=int, default=3)
     ap.add_argument("--out_csv", type=str, default="iv_agent_output.csv")
-    ap.add_argument("--html_out", type=str, default="iv_agent_output.html")  # << fixed (type=str)
+    ap.add_argument("--html_out", type=str, default="iv_agent_output.html")
     ap.add_argument("--open_html", action="store_true")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
     tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
-    if not tickers: print("No tickers."); sys.exit(1)
-
-    # --- Fetch lot sizes (official file) ---
     lot_map = fetch_lot_sizes()
-    if args.verbose:
-        print(f"Loaded {len(lot_map)} lot sizes from NSE file.")
 
-    # CSV overrides (if any)
     spot_map = read_csv_map(args.spot_csv, "ticker", "spot") if args.spot_csv else {}
     iv_map   = read_csv_map(args.iv_csv,   "ticker", "iv")   if args.iv_csv   else {}
 
     csv_rows: List[Dict[str,str]] = []
     js_rows: List[dict] = []
-    skipped: List[str] = []
 
     for sym in tickers:
         key = normalize_symbol_key(sym)
-        lot = lot_map.get(key)
-        if lot is None:
-            lot = 1  # default if not in F&O file
+        lot = lot_map.get(key, 1)
 
-        spot = spot_map.get(sym)
-        iv   = iv_map.get(sym)
-        chosen_exp = ""
-
+        # spot + iv
+        spot = spot_map.get(sym); iv = iv_map.get(sym); chosen_exp = ""
         if args.live_iv:
-            s_live, iv_live, chosen_exp_live = fetch_iv_spot_from_nse(sym, args.days)
-            if args.verbose: print(f"[NSE] {sym}: spot={s_live} iv={iv_live} exp={chosen_exp_live}")
+            s_live, iv_live, exp_live = fetch_iv_spot_from_nse(sym, args.days)
             if s_live is not None: spot = s_live
-            if iv_live is not None: iv   = iv_live
-            if chosen_exp_live:     chosen_exp = chosen_exp_live
-
+            if iv_live is not None: iv = iv_live
+            if exp_live: chosen_exp = exp_live
         if spot is None and args.use_yfinance_fallback:
             try:
                 import yfinance as yf
@@ -672,138 +743,75 @@ def main():
                 data = yf.Ticker(s).history(period="1d")
                 if data is not None and not data.empty:
                     spot = float(data["Close"].iloc[-1])
-            except Exception:
-                pass
-            if args.verbose: print(f"[YF ] {sym}: spot={spot}")
-
+            except Exception: pass
         if iv is None: iv = args.default_iv
-        if iv > 1.0: iv = iv / 100.0
-        iv = max(0.01, min(iv, 3.0))
+        if iv > 1.0: iv = iv/100.0
+        if spot is None: continue
 
-        if spot is None:
-            if args.verbose: print(f"[SKIP] {sym}: no spot from NSE/CSV{'/yfinance' if args.use_yfinance_fallback else ''}")
-            skipped.append(sym); continue
-
-        ic, bps, ls, primary, extra = build_strategies(
-            StrategyInputs(
-                spot=spot, iv=iv, lot=lot, days=args.days, r=args.risk_free, q=args.yield_div,
-                sigma_ic=args.sigma_ic, sigma_bps=args.sigma_bps, sigma_ls=args.sigma_ls,
-                width_pct_ic=args.width_pct_ic, width_pct_bps=args.width_pct_bps
-            )
+        # generate all & rank
+        all_strats, em, stride = gen_all_strats(
+            spot, iv, args.days, args.risk_free, args.yield_div,
+            args.sigma_ic, args.sigma_bps, args.sigma_ls,
+            args.width_pct_ic, args.width_pct_bps,
+            args.allow_naked
         )
+        # score
+        scored = [(score_strategy(s, spot, em), s) for s in all_strats]
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top = [s for _,s in scored[:max(1,args.top_n)]]
 
-        # ----- CSV row (strings for Excel) -----
-        def lotify(x: Optional[float]) -> str:
-            if x is None: return ""
-            return f"{x*lot:.2f}"
-
-        if primary.name == "Long Strangle":
-            prim_profit_sh, prim_loss_sh = "Uncapped", f"{ls.max_loss:.2f}"
-        else:
-            prim_profit_sh, prim_loss_sh = f"{primary.max_profit:.2f}", f"{primary.max_loss:.2f}"
-
+        # CSV (top only – primary = top[0])
+        primary = top[0]
+        def fmt(x): return "" if x is None else f"{x:.2f}"
         csv_rows.append({
-            "Symbol": sym,
-            "Expiry(closest)": chosen_exp,
-            "Spot": f"{spot:.2f}",
-            "ATM IV": f"{iv:.4f}",
-            "Lot": lot,
-            "1σ Move(₹)": f"{extra.em:.2f}",
-            "Range ±1σ": f"{spot - extra.em:.2f}–{spot + extra.em:.2f}",
-            # Primary
-            "Primary Strategy": primary.name,
-            "Action (Buy/Sell)": primary.action,
-            "Primary Max Profit (₹/sh)": prim_profit_sh,
-            "Primary Max Loss (₹/sh)":   prim_loss_sh,
-            "Primary Max Profit (₹/lot)": "Uncapped" if primary.name=="Long Strangle" else lotify(primary.max_profit),
-            "Primary Max Loss (₹/lot)":   lotify(primary.max_loss),
-            # IC
-            "IC Short Put":  ic.strikes["ShortPut"],
-            "IC Long Put":   ic.strikes["LongPut"],
-            "IC Short Call": ic.strikes["ShortCall"],
-            "IC Long Call":  ic.strikes["LongCall"],
-            "IC Credit (₹/sh)": f"{ic.credit_or_debit:.2f}",
-            "IC Credit (₹/lot)": lotify(ic.credit_or_debit),
-            "IC BE Low": f"{ic.be_low:.2f}",
-            "IC BE High": f"{ic.be_high:.2f}",
-            "IC Max Risk (₹/sh)": f"{ic.max_loss:.2f}",
-            "IC Max Risk (₹/lot)": lotify(ic.max_loss),
-            "IC ROI %": f"{ic.roi*100:.1f}",
-            # BPS
-            "BPS Short Put": bps.strikes["ShortPut"],
-            "BPS Long Put":  bps.strikes["LongPut"],
-            "BPS Credit (₹/sh)": f"{bps.credit_or_debit:.2f}",
-            "BPS Credit (₹/lot)": lotify(bps.credit_or_debit),
-            "BPS BE": f"{bps.be_low:.2f}",
-            "BPS Max Risk (₹/sh)": f"{bps.max_loss:.2f}",
-            "BPS Max Risk (₹/lot)": lotify(bps.max_loss),
-            "BPS ROI %": f"{bps.roi*100:.1f}",
-            # LS
-            "LS Put":  ls.strikes["Put"],
-            "LS Call": ls.strikes["Call"],
-            "LS Cost (₹/sh)": f"{-ls.credit_or_debit:.2f}",
-            "LS Cost (₹/lot)": lotify(-ls.credit_or_debit),
-            "LS BE Low": f"{ls.be_low:.2f}",
-            "LS BE High": f"{ls.be_high:.2f}",
+            "Symbol": sym, "Expiry(closest)": chosen_exp, "Lot": lot,
+            "Spot": f"{spot:.2f}", "ATM IV": f"{iv:.4f}",
+            "1σ Move(₹)": f"{em:.2f}", "Range ±1σ": f"{spot-em:.2f}–{spot+em:.2f}",
+            "Top1 Strategy": primary.name, "Top1 POP%": "" if primary.pop is None else f"{primary.pop*100:.1f}",
+            "Top1 ROI%": "" if primary.roi is None else f"{primary.roi*100:.1f}",
+            "Top1 BE": f"{fmt(primary.be_low)} / {fmt(primary.be_high)}",
+            "Top1 Credit/Debit (₹/sh)": f"{primary.credit_debit_sh:.2f}",
+            "Top1 Max Profit (₹/sh)": "Uncapped" if primary.max_profit_sh is None else f"{primary.max_profit_sh:.2f}",
+            "Top1 Max Loss (₹/sh)": "" if primary.max_loss_sh is None else f"{primary.max_loss_sh:.2f}",
         })
 
-        # ----- JS (numeric) row for website -----
-        js_rows.append({
-            "symbol": sym,
-            "expiry": chosen_exp,
-            "spot": float(f"{spot:.6f}"),
-            "iv": float(f"{iv:.6f}"),
-            "lot": int(lot),
-            "days": args.days,
-            "em": float(f"{extra.em:.6f}"),
-            "primary": {
-                "name": primary.name,
-                "action": primary.action,
-                "be_low": None if primary.be_low is None else float(f"{primary.be_low:.6f}"),
-                "be_high": None if primary.be_high is None else float(f"{primary.be_high:.6f}"),
-                "max_profit_sh": "Uncapped" if primary.name=="Long Strangle" else f"{primary.max_profit:.2f}",
-                "max_loss_sh": f"{primary.max_loss:.2f}" if isinstance(primary.max_loss,(int,float)) else "—",
-                "max_profit_lot": "Uncapped" if primary.name=="Long Strangle" else f"{(primary.max_profit or 0)*lot:.2f}",
-                "max_loss_lot": f"{(primary.max_loss or 0)*lot:.2f}",
-            },
-            "ic": {
-                "sp": ic.strikes["ShortPut"], "lp": ic.strikes["LongPut"],
-                "sc": ic.strikes["ShortCall"], "lc": ic.strikes["LongCall"],
-                "credit_sh": float(f"{ic.credit_or_debit:.6f}"),
-                "credit_lot": float(f"{ic.credit_or_debit*lot:.6f}"),
-                "width": int(extra.ic_width),
-                "be_low": float(f"{ic.be_low:.6f}"), "be_high": float(f"{ic.be_high:.6f}"),
-                "risk_sh": float(f"{ic.max_loss:.6f}"), "roi": float(f"{ic.roi:.6f}")
-            },
-            "bps": {
-                "sp": bps.strikes["ShortPut"], "lp": bps.strikes["LongPut"],
-                "credit_sh": float(f"{bps.credit_or_debit:.6f}"),
-                "credit_lot": float(f"{bps.credit_or_debit*lot:.6f}"),
-                "be": float(f"{bps.be_low:.6f}"),
-                "risk_sh": float(f"{bps.max_loss:.6f}"),
-                "width": int(extra.bps_width),
-                "roi": float(f"{bps.roi:.6f}")
-            },
-            "ls": {
-                "kp": ls.strikes["Put"], "kc": ls.strikes["Call"],
-                "debit_sh": float(f"{-ls.credit_or_debit:.6f}"),
-                "debit_lot": float(f"{-ls.credit_or_debit*lot:.6f}"),
-                "be_low": float(f"{ls.be_low:.6f}"), "be_high": float(f"{ls.be_high:.6f}")
+        # Website data
+        def to_js(s: StratResult):
+            return {
+                "key": s.key, "name": s.name, "group": s.group, "style": s.style,
+                "credit_debit_sh": float(f"{s.credit_debit_sh:.6f}"),
+                "be_low": None if s.be_low is None else float(f"{s.be_low:.6f}"),
+                "be_high": None if s.be_high is None else float(f"{s.be_high:.6f}"),
+                "max_profit_sh": None if s.max_profit_sh is None else float(f"{s.max_profit_sh:.6f}"),
+                "max_loss_sh": None if s.max_loss_sh is None else float(f"{s.max_loss_sh:.6f}"),
+                "roi": None if s.roi is None else float(f"{s.roi:.6f}"),
+                "pop": None if s.pop is None else float(f"{s.pop:.6f}"),
+                "strikes": s.strikes, "notes": s.notes
             }
+        js_rows.append({
+            "symbol": sym, "expiry": chosen_exp, "spot": float(f"{spot:.6f}"),
+            "iv": float(f"{iv:.6f}"), "lot": int(lot), "days": args.days, "em": float(f"{em:.6f}"),
+            "top": [to_js(s) for s in top],
+            "all": [to_js(s) for _,s in scored]
         })
 
-    if not csv_rows:
-        print("No results (every ticker skipped)."); sys.exit(2)
+    if not js_rows:
+        print("No data generated. Check connectivity / symbols.")
+        sys.exit(2)
 
+    # Outputs
     write_csv(args.out_csv, csv_rows)
-    write_html(args.html_out, args.out_csv, args.days, js_rows)
+    html = (HTML.replace("__GENERATED__", dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                 .replace("__DAYS__", str(args.days))
+                 .replace("__CSV_NAME__", os.path.basename(args.out_csv))
+                 .replace("__TOPN__", str(max(1,args.top_n)))
+                 .replace("__DATA_JSON__", json.dumps(js_rows, ensure_ascii=False)))
+    with open(args.html_out, "w", encoding="utf-8") as f:
+        f.write(html)
 
-    print(f"\nSaved CSV : {os.path.abspath(args.out_csv)}")
+    print(f"Saved CSV : {os.path.abspath(args.out_csv)}")
     print(f"Saved HTML: {os.path.abspath(args.html_out)}")
-    if skipped: print("Skipped (no spot): " + ", ".join(skipped))
-
-    if args.open_html:
-        webbrowser.open("file://" + os.path.abspath(args.html_out))
+    if args.open_html: webbrowser.open("file://" + os.path.abspath(args.html_out))
 
 if __name__ == "__main__":
     main()
