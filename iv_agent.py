@@ -445,15 +445,12 @@ HTML = r"""<!doctype html>
 <title>IV Agent – Top Strategies</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
-  :root{--bg:#070b16;--card:#0f1629;--panel:#0b1222;--txt:#e8ecf6;--muted:#a4afc6;--line:#1b2a4a;--accent:#7aa2f7}
+  :root{--bg:#070b16;--card:#0f1629;--panel:#0b1222;--txt:#e8ecf6;--muted:#a4afc6;--line:#1b2a4a;--accent:#7aa2f7;--ok:#16a34a;--warn:#f59e0b}
   *{box-sizing:border-box}
-  body{
-    margin:0;
-    background:radial-gradient(1000px 600px at 10% -10%,#1c2550 0%,transparent 60%),
-               radial-gradient(900px 600px at 110% 10%,#1d3a3f 0%,transparent 55%),var(--bg);
-    color:var(--txt);
-    font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Ubuntu,Arial,sans-serif
-  }
+  body{margin:0;background:
+      radial-gradient(1000px 600px at 10% -10%,#1c2550 0%,transparent 60%),
+      radial-gradient(900px 600px at 110% 10%,#1d3a3f 0%,transparent 55%),var(--bg);
+      color:var(--txt);font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Ubuntu,Arial,sans-serif}
   .wrap{max-width:1180px;margin:0 auto;padding:24px}
   h1{margin:0 0 4px 0;font-size:28px;letter-spacing:.3px}
   .meta{color:var(--muted);margin-bottom:18px}
@@ -468,35 +465,47 @@ HTML = r"""<!doctype html>
   .row{display:flex;justify-content:space-between;margin-top:8px;color:var(--muted)}
   .pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;margin-top:10px;background:#173225;color:#8bffa9}
 
-  /* ===== Detail Panel: bigger, clearer ===== */
+  /* Detail modal */
   .detail{position:fixed;inset:0;background:rgba(5,8,15,.65);display:none;align-items:flex-start;justify-content:center;padding:32px 16px;backdrop-filter:blur(4px);z-index:9999}
-  .panel{
-    width:min(1280px,96vw);   /* wider than before */
-    max-height:92vh;overflow:auto;background:var(--panel);border:1px solid #1c294b;border-radius:18px;padding:22px
-  }
+  .panel{width:min(1280px,96vw);max-height:92vh;overflow:auto;background:var(--panel);border:1px solid #1c294b;border-radius:18px;padding:22px}
   .panelhead{display:flex;gap:8px;align-items:center;justify-content:space-between;margin-bottom:12px}
-  .title{font-size:24px;font-weight:800} /* bigger selected name */
+  .title{font-size:24px;font-weight:800}
   .sub{color:var(--muted);font-size:14px}
   .close{background:#25365e;border:1px solid #334876;color:#dbe4ff;border-radius:10px;padding:8px 10px;cursor:pointer}
 
-  .cols{display:grid;grid-template-columns:1.2fr .8fr;gap:18px}
+  /* Layout: left = strategy list; right = strategy detail; chart comes AFTER details */
+  .cols{display:grid;grid-template-columns:0.95fr 1.05fr;gap:18px}
   @media (max-width:1024px){.cols{grid-template-columns:1fr}}
-
   .box{background:#0e1933;border:1px solid #1c2a51;border-radius:14px;padding:14px}
-  canvas{width:100%;height:380px;background:#0b1427;border:1px solid #1b2a4a;border-radius:14px}
-  .legend{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0 0}
-  .chip{display:flex;align-items:center;gap:6px;background:#162243;border:1px solid #233463;border-radius:999px;padding:8px 12px;cursor:pointer;font-size:14px}
-  .chip.active{outline:2px solid #2f4aa8}
-  .tab{display:inline-block;margin:0 8px 8px 0;padding:8px 12px;border-radius:999px;background:#14203f;border:1px solid #233463;cursor:pointer}
-  .tab.active{outline:2px solid #2f4aa8}
 
+  /* Strategy list (user friendly) */
+  .slist{display:flex;flex-direction:column;gap:8px;max-height:540px;overflow:auto;padding-right:4px}
+  .sitem{display:flex;align-items:center;justify-content:space-between;gap:10px;background:#0f1835;border:1px solid #233463;border-radius:12px;padding:10px 12px;cursor:pointer}
+  .sitem:hover{border-color:#2f4aa8}
+  .sitem.active{outline:2px solid #2f4aa8}
+  .sleft{display:flex;align-items:center;gap:10px;min-width:0}
+  .dot{width:10px;height:10px;border-radius:50%}
+  .sname{font-weight:700;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:260px}
+  .stags{color:#a5b4fc;font-size:12px}
+  .sright{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .badge{font-size:12px;border-radius:999px;padding:3px 8px;border:1px solid #334876;background:#162243}
+  .badge.ok{border-color:#285a36;background:#173225;color:#8bffa9}
+  .badge.warn{border-color:#7a540a;background:#382c0b;color:#ffd88a}
+
+  /* Selected strategy detail bigger */
+  #selName{font-size:20px;font-weight:800;margin-bottom:8px}
+  #ordersBody{font-size:15px;line-height:1.5;background:#0b1427;border:1px solid #1b2a4a;border-radius:12px;padding:12px;white-space:pre-wrap}
   table{width:100%;border-collapse:collapse;font-size:15px;margin-top:8px}
   th,td{padding:9px;border-bottom:1px solid #1e2846;text-align:left}
   .rowbtns{display:flex;gap:8px;margin-top:10px}
 
-  /* Selected strategy area larger */
-  #selName{font-size:20px;font-weight:800;margin-bottom:8px}
-  #ordersBody{font-size:15px;line-height:1.5}
+  /* Chart AFTER details */
+  canvas{width:100%;height:380px;background:#0b1427;border:1px solid #1b2a4a;border-radius:14px}
+  .legend{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 0}
+  .chip{display:flex;align-items:center;gap:6px;background:#162243;border:1px solid #233463;border-radius:999px;padding:8px 12px;cursor:pointer;font-size:14px}
+  .chip.active{outline:2px solid #2f4aa8}
+  .tab{display:inline-block;margin:0 8px 8px 0;padding:8px 12px;border-radius:999px;background:#14203f;border:1px solid #233463;cursor:pointer}
+  .tab.active{outline:2px solid #2f4aa8}
 </style>
 </head>
 <body>
@@ -515,46 +524,47 @@ HTML = r"""<!doctype html>
     </div>
 
     <div class="cols">
-      <!-- Left: chart + legend -->
+      <!-- LEFT: Recommended list -->
       <div class="box">
-        <div id="tabs"></div>
-        <canvas id="chart" width="1000" height="380"></canvas>
-        <div class="legend" id="legend"></div>
+        <div style="margin-bottom:8px;color:#cbd5e1"><b>Recommended (best first)</b> · click to view details</div>
+        <div id="strategyList" class="slist"></div>
       </div>
 
-      <!-- Right: strategy list + details -->
-      <div class="box">
-        <div style="margin-bottom:8px;color:#cbd5e1"><b>Best strategy</b> first · click any to see details</div>
-        <div id="strategyList" style="display:flex;flex-direction:column;gap:8px;margin-bottom:12px"></div>
+      <!-- RIGHT: Details first -->
+      <div>
+        <div class="box">
+          <div style="margin-bottom:8px;color:#cbd5e1"><b>Selected strategy</b></div>
+          <div id="selName">—</div>
 
-        <div style="margin:8px 0;color:#cbd5e1"><b>Selected strategy</b></div>
-        <div id="selName">—</div>
+          <div style="margin:8px 0;color:#cbd5e1"><b>Orders (per lot)</b></div>
+          <pre id="ordersBody">—</pre>
 
-        <!-- Orders / Strikes -->
-        <div style="margin:8px 0;color:#cbd5e1"><b>Orders (per lot)</b></div>
-        <pre id="ordersBody" style="background:#0b1427;border:1px solid #1b2a4a;border-radius:12px;padding:12px;white-space:pre-wrap;"></pre>
+          <table id="tbl"><thead>
+            <tr><th>Credit/Debit</th><th>B/E</th><th>Max P/L (₹/lot)</th><th>ROI%</th><th>POP%</th></tr>
+          </thead><tbody></tbody></table>
 
-        <!-- Quick summary -->
-        <table id="tbl"><thead>
-          <tr><th>Credit/Debit</th><th>B/E</th><th>Max P/L (₹/lot)</th><th>ROI%</th><th>POP%</th></tr>
-        </thead><tbody></tbody></table>
+          <div style="margin-top:12px;color:#cbd5e1"><b>Greeks @ Spot (per lot)</b></div>
+          <table id="greeksTbl"><thead>
+            <tr><th>Δ</th><th>Γ</th><th>Θ (per day)</th><th>Vega</th></tr>
+          </thead><tbody><tr><td colspan="4">—</td></tr></tbody></table>
 
-        <!-- Greeks -->
-        <div style="margin-top:12px;color:#cbd5e1"><b>Greeks @ Spot (per lot)</b></div>
-        <table id="greeksTbl"><thead>
-          <tr><th>Δ</th><th>Γ</th><th>Θ (per day)</th><th>Vega</th></tr>
-        </thead><tbody><tr><td colspan="4">—</td></tr></tbody></table>
+          <div style="margin-top:12px;color:#cbd5e1"><b>P&L Table (₹/lot)</b> · key points</div>
+          <table id="pnlTbl"><thead>
+            <tr><th>Price</th><th>Label</th><th>Payoff</th></tr>
+          </thead><tbody><tr><td colspan="3">—</td></tr></tbody></table>
 
-        <!-- P&L table -->
-        <div style="margin-top:12px;color:#cbd5e1"><b>P&L Table (₹/lot)</b> · key points</div>
-        <table id="pnlTbl"><thead>
-          <tr><th>Price</th><th>Label</th><th>Payoff</th></tr>
-        </thead><tbody><tr><td colspan="3">—</td></tr></tbody></table>
+          <div class="rowbtns">
+            <button id="dlPnl" class="btn">Download P&L CSV</button>
+            <button id="dlGreeks" class="btn">Download Greeks CSV</button>
+          </div>
+        </div>
 
-        <div class="rowbtns">
-          <button id="dlPnl" class="btn">Download P&L CSV</button>
-          <button id="dlGreeks" class="btn">Download Greeks CSV</button>
-          <span id="toggleAll" class="tab">Show all strategies</span>
+        <!-- THEN: payoff chart + legend -->
+        <div class="box" style="margin-top:14px">
+          <div id="tabs"></div>
+          <canvas id="chart" width="1000" height="380"></canvas>
+          <div class="legend" id="legend"></div>
+          <div style="margin-top:8px"><span id="toggleAll" class="tab">Show all strategies</span></div>
         </div>
       </div>
     </div>
@@ -562,11 +572,9 @@ HTML = r"""<!doctype html>
 </div>
 
 <script>
-/* ---------- Polyfills & helpers ---------- */
-/* erf polyfill for browsers/environments lacking Math.erf */
+/* ---------- Polyfill for Math.erf (some browsers miss it) ---------- */
 if (typeof Math.erf !== 'function') {
   Math.erf = function(x){
-    // Abramowitz & Stegun 7.1.26 approximation
     const sign = (x>=0)? 1 : -1;
     x = Math.abs(x);
     const a1=0.254829592, a2=-0.284496736, a3=1.421413741, a4=-1.453152027, a5=1.061405429, p=0.3275911;
@@ -575,7 +583,6 @@ if (typeof Math.erf !== 'function') {
     return sign*y;
   }
 }
-
 function cdf(x){return 0.5*(1+Math.erf(x/Math.SQRT2));}
 function bsPrice(S,K,t,r,sigma,q,type){
   if(t<=1e-9) return Math.max(0,type==='call'?S-K:K-S);
@@ -584,8 +591,7 @@ function bsPrice(S,K,t,r,sigma,q,type){
   if(type==='call') return S*Math.exp(-q*t)*cdf(d1)-K*Math.exp(-r*t)*cdf(d2);
   return K*Math.exp(-r*t)*cdf(-d2)-S*Math.exp(-q*t)*cdf(-d1);
 }
-
-/* Greeks (Black–Scholes) */
+/* Greeks */
 function bsGreeks(S,K,t,r,sigma,q,type){
   if (t<=1e-9) {
     const intrinsic = (type==='call') ? (S>K) : (K>S);
@@ -622,11 +628,8 @@ function payoffFromLegs(ST, legs, prem0){
     const sign = L.side==='long'? 1 : -1;
     const t=L.t_eval; const K=L.K; const iv=L.iv_eval;
     let v=0;
-    if(t<=1e-9){
-      v = L.kind==='call' ? Math.max(0, ST-K) : Math.max(0, K-ST);
-    }else{
-      v = bsPrice(ST,K,t,r,iv,q,L.kind);
-    }
+    if(t<=1e-9){ v = L.kind==='call' ? Math.max(0, ST-K) : Math.max(0, K-ST); }
+    else{ v = bsPrice(ST,K,t,r,iv,q,L.kind); }
     val += sign * L.qty * v;
   });
   return (val - prem0) * CUR.lot;
@@ -648,12 +651,7 @@ function aggregateGreeksPerLot(S, r, q, strat, lot){
 
 function formatGreeksRow(g){
   const theta_per_day = g.theta_per_year/365.0;
-  return [
-    g.delta.toFixed(3),
-    g.gamma.toExponential(3),
-    theta_per_day.toFixed(2),
-    g.vega.toFixed(2)
-  ];
+  return [ g.delta.toFixed(3), g.gamma.toExponential(3), theta_per_day.toFixed(2), g.vega.toFixed(2) ];
 }
 
 function keyPointsForPnL(S, em, strat){
@@ -674,7 +672,7 @@ function keyPointsForPnL(S, em, strat){
 
 function legsToSummary(legs){ return legs.map(legText).join(', '); }
 
-/* ---------- Data bootstrap ---------- */
+/* ---------- Data ---------- */
 const DATA = __DATA_JSON__;
 const TOPN = __TOPN__;
 const cards = document.getElementById('cards');
@@ -693,6 +691,7 @@ DATA.forEach((d,i)=>{
   card.appendChild(p); cards.appendChild(card);
 });
 
+/* ---------- Panel refs ---------- */
 const detail=document.getElementById('detail');
 const d_sym=document.getElementById('d_sym'); const d_meta=document.getElementById('d_meta');
 const tblBody = document.querySelector('#tbl tbody');
@@ -710,8 +709,6 @@ let CUR=null, SHOW_ALL=false, selKeys=[], activeKey=null;
 
 function openDetail(i){
   CUR=DATA[i];
-
-  // guard: no strategies at all
   if (!CUR || !Array.isArray(CUR.all) || CUR.all.length===0) {
     d_sym.textContent = CUR?.symbol || '—';
     d_meta.textContent=`Lot: ${CUR?.lot||'—'} · Spot: ₹${(CUR?.spot||0).toFixed(2)} · No strategies computed`;
@@ -722,22 +719,18 @@ function openDetail(i){
     pnlBody.innerHTML = '<tr><td colspan="3">—</td></tr>';
     ordersBox.textContent = '—';
     detail.style.display='flex';
-    renderTabs(); draw();  // still render axes
+    renderTabs(); draw(); 
     return;
   }
-
-  // prefer best from top, otherwise first from all
   const bestKey = (CUR.top && CUR.top[0]) ? CUR.top[0].key : CUR.all[0].key;
-  activeKey = bestKey;
-  selKeys = [bestKey];
-  SHOW_ALL=false;
+  activeKey = bestKey; selKeys=[bestKey]; SHOW_ALL=false;
 
   d_sym.textContent=CUR.symbol;
   const ivx = (CUR.iv2!=null && isFinite(CUR.iv2)) ? (' · IVx '+(CUR.iv2*100).toFixed(1)+'%') : '';
   d_meta.textContent=`Expiry near: ${CUR.exp_near||'—'} · next: ${CUR.exp_next||'—'} · Lot: ${CUR.lot} · Spot: ₹${(+CUR.spot).toFixed(2)} · IVn ${(CUR.iv*100).toFixed(1)}%${ivx}`;
 
-  renderTabs();
   renderStrategyList();
+  renderTabs();
   renderLegend();
   updateSelectedDetail();
   draw();
@@ -745,44 +738,73 @@ function openDetail(i){
 }
 function closeDetail(){ detail.style.display='none'; }
 
-function renderTabs(){
-  tabs.innerHTML='';
-  ['±1σ','±1.5σ','±2σ'].forEach((t,idx)=>{
-    const span=document.createElement('span');span.className='tab'+(idx==0?' active':'');span.textContent=t;span.dataset.m=[1,1.5,2][idx];
-    span.onclick=(e)=>{Array.from(tabs.children).forEach(c=>c.classList.remove('active')); e.target.classList.add('active'); draw(parseFloat(e.target.dataset.m));}
-    tabs.appendChild(span);
-  });
-}
 function colorFor(i){return ['#60a5fa','#34d399','#fbbf24','#f472b6','#22d3ee','#e5e7eb'][i%6];}
-
 function allStratsBestFirst(){
   const best = (CUR.top && CUR.top[0]) ? CUR.top[0] : CUR.all[0];
   const rest = CUR.all.filter(s=>s.key!==best.key);
   return [best, ...rest];
 }
 
+/* --------- helper badges --------- */
+function styleEmoji(style){
+  if (style==='credit') return '💰';
+  if (style==='debit')  return '💸';
+  return '🧭';
+}
+function beSpanInfo(s){
+  // span across BOTH breakevens in units of σ-range (2*em)
+  if (s.be_low!=null && s.be_high!=null && isFinite(s.be_low) && isFinite(s.be_high) && CUR && isFinite(CUR.em) && CUR.em>0){
+    const span = (s.be_high - s.be_low)/(2*CUR.em);
+    return {label: 'Width '+span.toFixed(2)+'σ', val: span};
+  }
+  if (s.be_low!=null || s.be_high!=null) return {label: '1-side BE', val: 0.4}; // neutral mid rating
+  return {label: 'No BE', val: 0.0};
+}
+
+/* --------- Strategy list renderer (friendlier rows + new badges) --------- */
 function renderStrategyList(){
   strategyList.innerHTML='';
-  allStratsBestFirst().forEach((s,idx)=>{
-    const btn=document.createElement('span');
-    btn.className='chip'+(activeKey===s.key?' active':'');
-    btn.style.margin='0';
-    btn.innerHTML=`<span style="width:10px;height:10px;border-radius:50%;background:${colorFor(idx)}"></span>${s.name}`;
-    btn.onclick=()=>{ activeKey=s.key; selKeys=[s.key]; SHOW_ALL=false; renderLegend(); updateSelectedDetail(); draw(); };
-    strategyList.appendChild(btn);
+  const arr = allStratsBestFirst();
+  arr.forEach((s,idx)=>{
+    const item=document.createElement('div'); item.className='sitem'+(activeKey===s.key?' active':'');
+    const left=document.createElement('div'); left.className='sleft';
+    const dot=document.createElement('span'); dot.className='dot'; dot.style.background=colorFor(idx);
+    const sname=document.createElement('div'); sname.className='sname'; sname.textContent=`${styleEmoji(s.style)} ${s.name}`;
+    const stags=document.createElement('div'); stags.className='stags'; stags.textContent=s.group+' · '+(s.style||'');
+    left.appendChild(dot); left.appendChild(sname); left.appendChild(stags);
+
+    const right=document.createElement('div'); right.className='sright';
+    const pop=document.createElement('span'); pop.className='badge '+((s.pop||0)>=0.6?'ok':((s.pop||0)>=0.5?'':'warn'));
+    pop.textContent = 'POP ' + (s.pop==null?'—':(s.pop*100).toFixed(0)) + '%';
+    const roi=document.createElement('span'); roi.className='badge'; roi.textContent='ROI ' + (s.roi==null?'—':(s.roi*100).toFixed(0)) + '%';
+
+    const spanInfo = beSpanInfo(s);
+    const spanBadge=document.createElement('span');
+    spanBadge.className='badge ' + (spanInfo.val>=1.0 ? 'ok' : (spanInfo.val<0.6 ? 'warn' : ''));
+    spanBadge.textContent = spanInfo.label;
+
+    right.appendChild(pop); right.appendChild(roi); right.appendChild(spanBadge);
+
+    item.appendChild(left); item.appendChild(right);
+    item.onclick=()=>{ activeKey=s.key; selKeys=[s.key]; SHOW_ALL=false; 
+      Array.from(strategyList.children).forEach(el=>el.classList.remove('active')); item.classList.add('active');
+      renderLegend(); updateSelectedDetail(); draw(); 
+    };
+    strategyList.appendChild(item);
   });
 }
 
+/* --------- Legend & toggles (for chart overlays) --------- */
 function renderLegend(){
   legend.innerHTML='';
   const base = SHOW_ALL ? CUR.all : allStratsBestFirst();
   base.forEach((s,i)=>{
     const chip=document.createElement('span');chip.className='chip'+(selKeys.includes(s.key)?' active':'');
-    chip.innerHTML=`<span style="width:10px;height:10px;border-radius:50%;background:${colorFor(i)}"></span>${s.name}`;
+    chip.innerHTML=`<span style="width:10px;height:10px;border-radius:50%;background:${colorFor(i)}"></span>${styleEmoji(s.style)} ${s.name}`;
     chip.onclick=()=>{ 
       if(selKeys.includes(s.key)) selKeys=selKeys.filter(k=>k!==s.key);
       else selKeys.push(s.key);
-      if (!selKeys.length) selKeys=[base[0].key]; // ensure at least one
+      if (!selKeys.length) selKeys=[base[0].key];
       activeKey = selKeys[0];
       updateSelectedDetail(); draw(); renderLegend();
     };
@@ -798,7 +820,7 @@ function updateSelectedDetail(){
   const s = CUR.all.find(x=>x.key===activeKey) || (CUR.top && CUR.top[0]) || CUR.all[0];
   if (!s){ return; }
 
-  selName.textContent = s.name;
+  selName.textContent = `${styleEmoji(s.style)} ${s.name}`;
 
   const lines = s.legs.map(L=>legText(L));
   const cdSh = s.prem0_sh;
@@ -829,7 +851,6 @@ function updateSelectedDetail(){
     pnlBody.appendChild(tr);
   });
 
-  // downloads
   dlPnlBtn.onclick = ()=>{
     const rows=[['Price','Label','Payoff (₹/lot)']];
     pts.forEach(p=>rows.push([p.x.toFixed(2), p.label, f(p.x).toFixed(2)]));
@@ -842,10 +863,19 @@ function updateSelectedDetail(){
   };
 }
 
+function renderTabs(){
+  tabs.innerHTML='';
+  ['±1σ','±1.5σ','±2σ'].forEach((t,idx)=>{
+    const span=document.createElement('span');span.className='tab'+(idx==0?' active':'');span.textContent=t;span.dataset.m=[1,1.5,2][idx];
+    span.onclick=(e)=>{Array.from(tabs.children).forEach(c=>c.classList.remove('active')); e.target.classList.add('active'); draw(parseFloat(e.target.dataset.m));}
+    tabs.appendChild(span);
+  });
+}
+
 function draw(mult=1.0){
   const c=document.getElementById('chart'); const ctx=c.getContext('2d'); ctx.clearRect(0,0,c.width,c.height);
   const source = SHOW_ALL ? CUR.all : CUR.all.filter(s=>selKeys.includes(s.key));
-  if(!source || !source.length){ // draw axes only
+  if(!source || !source.length){
     ctx.strokeStyle="#1b2a4a"; ctx.strokeRect(40,20,c.width-80,c.height-50);
     const y0=c.height-30; ctx.beginPath(); ctx.moveTo(40,y0); ctx.lineTo(c.width-40,y0); ctx.stroke();
     return;
@@ -871,7 +901,7 @@ function draw(mult=1.0){
   });
 }
 
-// CSV downloader utility
+/* CSV download helper */
 function downloadCSV(rows, filename){
   const csv = rows.map(r=>r.map(v=>{
     const s = (v==null)?'':String(v);
