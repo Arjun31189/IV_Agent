@@ -24,9 +24,19 @@ Homepage shows stock cards only; click a card → detail panel with:
   • Aggregate Greeks per lot (Δ, Γ, Θ/day, Vega)
   • Download P&L / Greeks of selected strategy as CSV
 
+New in this version:
+  • --strike_mode sigma|delta|prob|ev
+    - sigma: original ±k·σ / width% approach (default)
+    - delta: target |Δ| for short & wing strikes (e.g., 0.18 / 0.05)
+    - prob : target tail probabilities under lognormal for shorts/wings
+    - ev   : coarse-grid EV optimizer for the Iron Condor (keeps others sigma unless adapted below)
+  • Robust breakeven finder + denser scan for POP
+  • Optional delta/prob strike picking for BPS/BCS/BECS/BEPS
+
 Run (example):
-  python iv_agent.py --tickers "RELIANCE,ICICIBANK,SBIN,TCS,INFY,ITC,BPCL,AMBUJACEM,AXISBANK,APOLLOHOSP,ASIANPAINT,BAJAJ_AUTO,BAJFINANCE,BEL,BRITANNIA,BSE,DALBHARAT,DIVISLAB,DIXON,EICHERMOT,GRASIM,HAVELLS,HCLTECH,HDFCLIFE,HEROMOTOCO,HINDALCO,ICICIPRULI,INDIGO,INDUSINDBK,JSWSTEEL,JINDALSTEL,JUBLFOOD,KOTAKBANK,LAURUSLABS,LICHSGFIN,LT,LTIM,M&M,ONGC,SHREECEM,TATAMOTORS,TATASTEEL,TECHM,TITAN,UPL,ADANIENT,ADANIPORTS" ^
-    --days 30 --live_iv --use_yfinance_fallback --top_n 3 --open_html
+  python iv_agent.py --tickers "RELIANCE,ICICIBANK,SBIN" \
+    --days 30 --live_iv --use_yfinance_fallback --top_n 3 --open_html \
+    --strike_mode delta --short_delta 0.18 --wing_delta 0.05
 """
 
 from __future__ import annotations
@@ -52,6 +62,72 @@ def bs_price(S: float, K: float, t: float, r: float, sigma: float, q: float = 0.
         return S*math.exp(-q*t)*norm_cdf(d1) - K*math.exp(-r*t)*norm_cdf(d2)
     else:
         return K*math.exp(-r*t)*norm_cdf(-d2) - S*math.exp(-q*t)*norm_cdf(-d1)
+
+# ---- Extra Math Helpers (Delta / Tail-Prob / Inverse-Normal etc.) -----------
+
+def inv_norm_cdf(p: float) -> float:
+    """Approximate inverse CDF (Acklam). p in (0,1)."""
+    p = min(max(p, 1e-12), 1-1e-12)
+    a1=-3.969683028665376e+01; a2= 2.209460984245205e+02; a3=-2.759285104469687e+02
+    a4= 1.383577518672690e+02; a5=-3.066479806614716e+01; a6= 2.506628277459239e+00
+    b1=-5.447609879822406e+01; b2= 1.615858368580409e+02; b3=-1.556989798598866e+02
+    b4= 6.680131188771972e+01; b5=-1.328068155288572e+01
+    c1=-7.784894002430293e-03; c2=-3.223964580411365e-01; c3=-2.400758277161838e+00
+    c4=-2.549732539343734e+00; c5= 4.374664141464968e+00; c6= 2.938163982698783e+00
+    d1= 7.784695709041462e-03; d2= 3.224671290700398e-01; d3= 2.445134137142996e+00
+    d4= 3.754408661907416e+00
+    plow=0.02425; phigh=1-plow
+    if p < plow:
+        q = math.sqrt(-2*math.log(p))
+        return (((((c1*q+c2)*q+c3)*q+c4)*q+c5)*q+c6)/((((d1*q+d2)*q+d3)*q+d4)*q+1)
+    if p > phigh:
+        q = math.sqrt(-2*math.log(1-p))
+        return -(((((c1*q+c2)*q+c3)*q+c4)*q+c5)*q+c6)/((((d1*q+d2)*q+d3)*q+d4)*q+1)
+    q = p-0.5; r=q*q
+    return (((((a1*r+a2)*r+a3)*r+a4)*r+a5)*r+a6)*q/(((((b1*r+b2)*r+b3)*r+b4)*r+b5)*r+1)
+
+def d1_val(S,K,t,r,sigma,q):
+    return (math.log(S/K) + (r - q + 0.5*sigma*sigma)*t) / (sigma*math.sqrt(t))
+
+def call_delta(S,K,t,r,sigma,q):
+    return math.exp(-q*t)*norm_cdf(d1_val(S,K,t,r,sigma,q))
+
+def put_delta(S,K,t,r,sigma,q):
+    return math.exp(-q*t)*(norm_cdf(d1_val(S,K,t,r,sigma,q))-1.0)
+
+def strike_for_target_call_delta(S,t,r,q,sigma,target_delta):
+    """Find K s.t. call delta ~= target_delta (0..1)."""
+    lo, hi = S*0.2, S*5.0
+    for _ in range(60):
+        mid = (lo+hi)/2.0
+        d = call_delta(S, mid, t, r, sigma, q)
+        if d > target_delta: lo = mid
+        else: hi = mid
+    return (lo+hi)/2.0
+
+def strike_for_target_put_delta(S,t,r,q,sigma,target_abs_delta):
+    """Find K for OTM put (delta negative; abs≈target_abs_delta)."""
+    lo, hi = S*0.2, S*5.0
+    for _ in range(60):
+        mid = (lo+hi)/2.0
+        d = abs(put_delta(S, mid, t, r, sigma, q))
+        if d > target_abs_delta: hi = mid   # deeper ITM (bigger |Δ|)
+        else: lo = mid
+    return (lo+hi)/2.0
+
+def strike_for_otm_prob(S,t,r,q,sigma, upper_tail_prob: float, is_call: bool) -> float:
+    """Choose K so that P(ST > K)=p (call) or P(ST < K)=p (put) under lognormal."""
+    mu = math.log(S) + (r - q - 0.5*sigma*sigma)*t
+    s  = sigma*math.sqrt(t)
+    if is_call:
+        z = inv_norm_cdf(1.0 - upper_tail_prob)
+        lnK = mu + s*z
+    else:
+        z = inv_norm_cdf(upper_tail_prob)
+        lnK = mu + s*z
+    return math.exp(lnK)
+
+# --------------------------- Stride helpers ----------------------------------
 
 def suggest_stride(spot: float) -> int:
     if spot < 200: return 1
@@ -222,49 +298,153 @@ def pnl_at(S: float, r: float, q: float, legs: List[Leg], prem0: float) -> float
     value_now = sum(price_leg_now(S, r, q, L) for L in legs)
     return value_now - prem0
 
-def scan_metrics(S: float, em: float, r: float, q: float, legs: List[Leg], prem0: float) -> Tuple[float,float,Optional[float],Optional[float],float]:
-    """Return (maxP, maxL, beL, beH, pop) by scanning ±3σ and integrating normal pdf."""
-    lo = max(0.0, S - 3.0*em); hi = S + 3.0*em
-    N = 800
-    xs = [lo + (hi-lo)*i/N for i in range(N+1)]
-    ys = [pnl_at(x, r, q, legs, prem0) for x in xs]
-    maxP = max(ys); minP = min(ys)
+# ------- Robust breakevens + POP scan (denser grid for accuracy) --------------
+
+def find_breakevens(xs: List[float], ys: List[float], S: float) -> Tuple[Optional[float], Optional[float]]:
     beL = None; beH = None
+    roots = []
     for i in range(1, len(xs)):
-        if ys[i-1]==0: beL=xs[i-1]
-        if ys[i]==0: beH=xs[i]
+        if ys[i-1] == 0.0:
+            roots.append(xs[i-1]); continue
+        if ys[i] == 0.0:
+            roots.append(xs[i]); continue
         if ys[i-1]*ys[i] < 0:
             x1,x2=xs[i-1],xs[i]; y1,y2=ys[i-1],ys[i]
             xz = x1 - y1*(x2-x1)/(y2-y1)
-            if xz < S: beL = xz
-            else: 
-                beH = xz
-                break
-    # POP: integrate probability P( P&L >=0 ) under N(S, em^2)
+            roots.append(xz)
+    if roots:
+        roots.sort()
+        for r_ in roots:
+            if r_ < S: beL = r_
+            if r_ >= S and beH is None: beH = r_
+    return beL, beH
+
+def scan_metrics(S: float, em: float, r: float, q: float, legs: List[Leg], prem0: float) -> Tuple[float,float,Optional[float],Optional[float],float]:
+    lo = max(0.0, S - 3.5*em); hi = S + 3.5*em
+    N = 1400
+    xs = [lo + (hi-lo)*i/N for i in range(N+1)]
+    ys = [pnl_at(x, r, q, legs, prem0) for x in xs]
+    maxP = max(ys); minP = min(ys)
+    beL, beH = find_breakevens(xs, ys, S)
+    # POP integrate
     def z(x): return (x - S) / (em if em>1e-9 else 1.0)
-    pop_count = 0.0; tot = 0.0
-    for i,x in enumerate(xs):
-        w = (norm_cdf(z(x+(hi-lo)/N)) - norm_cdf(z(x)))
-        if ys[i] >= 0: pop_count += w
-        tot += w
-    pop = pop_count / tot if tot>0 else None
+    pop_num = 0.0; pop_den = 0.0
+    for i in range(N):
+        x1, x2 = xs[i], xs[i+1]
+        w = norm_cdf(z(x2)) - norm_cdf(z(x1))
+        if ys[i] >= 0 and ys[i+1] >= 0: pop_num += w
+        elif ys[i] * ys[i+1] < 0:
+            m = x1 - ys[i]*(x2-x1)/(ys[i+1]-ys[i])
+            w1 = norm_cdf(z(m)) - norm_cdf(z(x1))
+            w2 = norm_cdf(z(x2)) - norm_cdf(z(m))
+            if ys[i] >= 0: pop_num += w1
+            else: pop_num += w2
+        pop_den += w
+    pop = pop_num / pop_den if pop_den>0 else None
     return maxP, -minP if minP<0 else 0.0, beL, beH, pop
 
-# ------------------------- Strategy Builders (legs) --------------------------
+# ------------------------- Strike selection utilities -------------------------
 
 def width_from_pct(S, pct, stride): return max(stride*2, round_to_stride(pct*S, stride))
 
 def make_leg(kind, side, K, qty, t0, iv0, t_eval, iv_eval) -> Leg:
     return Leg(kind=kind, side=side, K=int(K), qty=int(qty), t0=float(t0), iv0=float(iv0), t_eval=float(t_eval), iv_eval=float(iv_eval))
 
-def build_strategies_full(S: float, iv: float, iv2: Optional[float], days_near: int, days_next: Optional[int],
-                          r: float, q: float, stride: int,
-                          sigma_ic: float, sigma_bps: float, sigma_ls: float,
-                          w_ic_pct: float, w_bps_pct: float,
-                          allow_naked: bool) -> List[Strat]:
+def choose_strikes(
+    mode: str, S: float, em: float, t: float, r: float, q: float, sigma: float, stride: int,
+    short_delta: float, wing_delta: float, short_tail_prob: float, wing_tail_prob: float,
+    k_sigma: float, width_pct: float
+) -> Tuple[int,int,int,int]:
+    """
+    Return (short_put, long_put, short_call, long_call) integer strikes for a symmetric IC shell.
+    - mode='sigma'  : shorts at ± k_sigma*em ; wings wider by width_pct*spot
+    - mode='delta'  : shorts at |Δ|=short_delta; wings at |Δ|=wing_delta
+    - mode='prob'   : shorts at tail probs; wings at wing tail probs
+    """
+    if mode == "delta":
+        sp = round_to_stride(strike_for_target_put_delta(S, t, r, q, sigma, short_delta), stride)
+        lp = round_to_stride(strike_for_target_put_delta(S, t, r, q, sigma, wing_delta),  stride)
+        sc = round_to_stride(strike_for_target_call_delta(S, t, r, q, sigma, short_delta), stride)
+        lc = round_to_stride(strike_for_target_call_delta(S, t, r, q, sigma, wing_delta),  stride)
+        lp = min(lp, sp - max(stride, abs(sp-lp)))
+        lc = max(lc, sc + max(stride, abs(lc-sc)))
+        return sp, lp, sc, lc
+
+    if mode == "prob":
+        sp_f = strike_for_otm_prob(S, t, r, q, sigma, short_tail_prob, is_call=False)
+        lp_f = strike_for_otm_prob(S, t, r, q, sigma, wing_tail_prob,  is_call=False)
+        sc_f = strike_for_otm_prob(S, t, r, q, sigma, short_tail_prob, is_call=True)
+        lc_f = strike_for_otm_prob(S, t, r, q, sigma, wing_tail_prob,  is_call=True)
+        sp = round_to_stride(sp_f, stride); lp = round_to_stride(lp_f, stride)
+        sc = round_to_stride(sc_f, stride); lc = round_to_stride(lc_f, stride)
+        lp = min(lp, sp - max(stride, abs(sp-lp)))
+        lc = max(lc, sc + max(stride, abs(lc-sc)))
+        return sp, lp, sc, lc
+
+    # default = 'sigma'
+    sc = round_to_stride(S + k_sigma*em, stride)
+    lc = sc + max(stride*2, round_to_stride(width_pct*S, stride))
+    sp = round_to_stride(S - k_sigma*em, stride)
+    lp = sp - max(stride*2, round_to_stride(width_pct*S, stride))
+    return sp, lp, sc, lc
+
+# ----------------------------- EV optimizer (IC) ------------------------------
+
+def expected_value_of_legs_normal(
+    S: float, em: float, r: float, q: float, legs: List[Leg], prem0: float, span_mult: float = 3.0
+) -> float:
+    """Approx EV under Normal(S, em^2) for payoff at evaluation (not risk-neutral)."""
+    lo = max(0.0, S - span_mult*em); hi = S + span_mult*em
+    N = 900
+    dx = (hi - lo) / N
+    ev = 0.0
+    denom = em if em>1e-9 else 1.0
+    for i in range(N+1):
+        x = lo + i*dx
+        w = norm_pdf((x - S)/denom) * dx / denom
+        ev += pnl_at(x, r, q, legs, prem0) * w
+    return ev
+
+def optimize_ic_ev(
+    S: float, em: float, tN: float, r: float, q: float, iv: float, stride: int,
+    k_list: List[float], w_list: List[float]
+) -> Tuple[Tuple[int,int,int,int], float]:
+    """Grid over k_sigma and width_pct to maximize EV for Short IC."""
+    best = None; best_ev = -1e99
+    for k_sigma in (k_list or [1.0, 1.2]):
+        for width_pct in (w_list or [0.02]):
+            sp, lp, sc, lc = choose_strikes("sigma", S, em, tN, r, q, iv, stride,
+                                            0.18,0.05, 0.18,0.05, k_sigma, width_pct)
+            legs = [
+                make_leg('put','short',sp,1,tN,iv,0.0,iv),
+                make_leg('put','long', lp,1,tN,iv,0.0,iv),
+                make_leg('call','short',sc,1,tN,iv,0.0,iv),
+                make_leg('call','long', lc,1,tN,iv,0.0,iv)
+            ]
+            p0 = sum(price_leg_entry(S, r, q, L) for L in legs)
+            ev = expected_value_of_legs_normal(S, em, r, q, legs, p0)
+            if ev > best_ev:
+                best_ev = ev; best = (sp, lp, sc, lc)
+    return best, best_ev
+
+# ------------------------- Strategy Builders (legs) --------------------------
+
+def build_strategies_full(
+    S: float, iv: float, iv2: Optional[float], days_near: int, days_next: Optional[int],
+    r: float, q: float, stride: int,
+    sigma_ic: float, sigma_bps: float, sigma_ls: float,
+    w_ic_pct: float, w_bps_pct: float,
+    allow_naked: bool,
+    strike_mode: str,
+    short_delta: float, wing_delta: float,
+    short_tail_prob: float, wing_tail_prob: float,
+    ev_k_list: List[float], ev_w_list: List[float]
+) -> List[Strat]:
+
     tN, emN, _ = stride_and_em(S, iv, days_near)
     tF = None
-    if iv2 is not None and days_next is not None: tF = max(1e-9, days_next/365.0)
+    if iv2 is not None and days_next is not None:
+        tF = max(1e-9, days_next/365.0)
     results: List[Strat] = []
 
     def prem0(legs): return sum(price_leg_entry(S,r,q,L) for L in legs)
@@ -276,24 +456,43 @@ def build_strategies_full(S: float, iv: float, iv2: Optional[float], days_near: 
         elif style=="debit"  and p0<0 and maxP>0: roi = maxP / (-p0)
         results.append(Strat(key,name,group,style,legs,p0,beL,beH,maxP,maxL,roi,pop,notes))
 
-    # --- Core positions (single expiry) ---
-    wIC = width_from_pct(S, w_ic_pct, stride)
-    wSP = width_from_pct(S, w_bps_pct, stride)
-    atm  = round_to_stride(S, stride)
+    # --- Iron Condor (Short) with selectable strike logic / EV optimizer ---
+    if strike_mode == "ev":
+        (sp, lp, sc, lc), _best_ev = optimize_ic_ev(
+            S, emN, tN, r, q, iv, stride, k_list=ev_k_list, w_list=ev_w_list
+        )
+        ic_notes = f"EV-opt · SP {sp}/LP {lp} · SC {sc}/LC {lc}"
+    else:
+        sp, lp, sc, lc = choose_strikes(
+            strike_mode, S, emN, tN, r, q, iv, stride,
+            short_delta, wing_delta, short_tail_prob, wing_tail_prob,
+            sigma_ic, w_ic_pct
+        )
+        ic_notes = f"{strike_mode} · SP {sp}/LP {lp} · SC {sc}/LC {lc}"
 
-    # Short Iron Condor
-    sc = round_to_stride(S + sigma_ic*emN, stride); lc = sc + wIC
-    sp = round_to_stride(S - sigma_ic*emN, stride); lp = sp - wIC
     legs=[ make_leg('put','short',sp,1,tN,iv,0.0,iv), make_leg('put','long',lp,1,tN,iv,0.0,iv),
            make_leg('call','short',sc,1,tN,iv,0.0,iv), make_leg('call','long',lc,1,tN,iv,0.0,iv) ]
-    finish("IC","Short Iron Condor","Neutral","credit",legs,f"±{sigma_ic:.2f}σ; width≈{w_ic_pct*100:.1f}%")
+    finish("IC","Short Iron Condor","Neutral","credit",legs,ic_notes)
 
-    # Short Iron Butterfly
-    legs=[ make_leg('put','short',atm,1,tN,iv,0.0,iv), make_leg('put','long',atm-wIC,1,tN,iv,0.0,iv),
-           make_leg('call','short',atm,1,tN,iv,0.0,iv), make_leg('call','long',atm+wIC,1,tN,iv,0.0,iv) ]
-    finish("IB","Short Iron Butterfly","Neutral","credit",legs,"ATM short straddle + wings")
+    # --- Iron Butterfly (Short) wings via same selection logic (ATM body) ---
+    atm  = round_to_stride(S, stride)
+    if strike_mode == "delta":
+        lp_ib = round_to_stride(strike_for_target_put_delta(S, tN, r, q, iv, wing_delta), stride)
+        lc_ib = round_to_stride(strike_for_target_call_delta(S, tN, r, q, iv, wing_delta), stride)
+    elif strike_mode == "prob":
+        lp_ib = round_to_stride(strike_for_otm_prob(S, tN, r, q, iv, wing_tail_prob,  is_call=False), stride)
+        lc_ib = round_to_stride(strike_for_otm_prob(S, tN, r, q, iv, wing_tail_prob,  is_call=True),  stride)
+    else:
+        wIC = width_from_pct(S, w_ic_pct, stride)
+        lp_ib = atm - wIC
+        lc_ib = atm + wIC
 
-    # Short Strangle / Straddle (naked)
+    legs=[ make_leg('put','short',atm,1,tN,iv,0.0,iv), make_leg('put','long',lp_ib,1,tN,iv,0.0,iv),
+           make_leg('call','short',atm,1,tN,iv,0.0,iv), make_leg('call','long',lc_ib,1,tN,iv,0.0,iv) ]
+    finish("IB","Short Iron Butterfly","Neutral","credit",legs,
+           f"{strike_mode} wings · LP {lp_ib} / LC {lc_ib}")
+
+    # --- Short Strangle / Straddle (naked) ---
     if allow_naked:
         kP = round_to_stride(S - 1.1*emN, stride); kC = round_to_stride(S + 1.1*emN, stride)
         legs=[ make_leg('put','short',kP,1,tN,iv,0.0,iv), make_leg('call','short',kC,1,tN,iv,0.0,iv) ]
@@ -301,7 +500,7 @@ def build_strategies_full(S: float, iv: float, iv2: Optional[float], days_near: 
         legs=[ make_leg('put','short',atm,1,tN,iv,0.0,iv), make_leg('call','short',atm,1,tN,iv,0.0,iv) ]
         finish("SSTRD","Short Straddle","Neutral","credit",legs,"ATM naked")
 
-    # Long Strangle / Straddle
+    # --- Long Strangle / Straddle (sigma-based distance preserved) ---
     kC = round_to_stride(S + sigma_ls*emN, stride); kP = round_to_stride(S - sigma_ls*emN, stride)
     legs=[ make_leg('call','long',kC,1,tN,iv,0.0,iv), make_leg('put','long',kP,1,tN,iv,0.0,iv) ]
     finish("LS","Long Strangle","Neutral","debit",legs,f"±{sigma_ls:.2f}σ long-vol")
@@ -309,68 +508,101 @@ def build_strategies_full(S: float, iv: float, iv2: Optional[float], days_near: 
     legs=[ make_leg('call','long',atm,1,tN,iv,0.0,iv), make_leg('put','long',atm,1,tN,iv,0.0,iv) ]
     finish("LSTRD","Long Straddle","Neutral","debit",legs,"ATM long-vol")
 
-    # Bull Put Spread (credit)
-    sp2 = round_to_stride(S - 1.0*emN, stride); lp2 = sp2 - wSP
+    # --- Bull Put Spread (credit): optional delta/prob selection ---
+    if strike_mode == "delta":
+        sp2 = round_to_stride(strike_for_target_put_delta(S,tN,r,q,iv, short_delta), stride)
+        lp2 = round_to_stride(strike_for_target_put_delta(S,tN,r,q,iv, max(wing_delta, min(0.5*short_delta, 0.10))), stride)
+    elif strike_mode == "prob":
+        sp2 = round_to_stride(strike_for_otm_prob(S,tN,r,q,iv, short_tail_prob, is_call=False), stride)
+        lp2 = round_to_stride(strike_for_otm_prob(S,tN,r,q,iv, wing_tail_prob,  is_call=False), stride)
+    else:
+        sp2 = round_to_stride(S - 1.0*emN, stride); lp2 = sp2 - width_from_pct(S, w_bps_pct, stride)
+
     legs=[ make_leg('put','short',sp2,1,tN,iv,0.0,iv), make_leg('put','long',lp2,1,tN,iv,0.0,iv) ]
     finish("BPS","Bull Put Spread","Bullish","credit",legs,"OTM put spread")
 
-    # Bull Call Spread (debit)
-    lc1 = round_to_stride(S + 0.2*emN, stride); sc1 = lc1 + wSP
+    # --- Bull Call Spread (debit): optional delta/prob selection (on calls) ---
+    if strike_mode == "delta":
+        lc1 = round_to_stride(strike_for_target_call_delta(S,tN,r,q,iv, max(0.30, short_delta)), stride)
+        sc1 = round_to_stride(strike_for_target_call_delta(S,tN,r,q,iv, max(0.60, short_delta + 0.25)), stride)
+    elif strike_mode == "prob":
+        # smaller upper-tail prob for long, larger for short (further OTM)
+        lc1 = round_to_stride(strike_for_otm_prob(S,tN,r,q,iv, max(0.30, short_tail_prob), is_call=True), stride)
+        sc1 = round_to_stride(strike_for_otm_prob(S,tN,r,q,iv, max(0.60, short_tail_prob + 0.25), is_call=True), stride)
+    else:
+        lc1 = round_to_stride(S + 0.2*emN, stride); sc1 = lc1 + width_from_pct(S, w_bps_pct, stride)
+
     legs=[ make_leg('call','long',lc1,1,tN,iv,0.0,iv), make_leg('call','short',sc1,1,tN,iv,0.0,iv) ]
     finish("BCS","Bull Call Spread","Bullish","debit",legs,"OTM call spread")
 
-    # Bear Call Spread (credit)
-    sc2 = round_to_stride(S + 1.0*emN, stride); lc2 = sc2 + wSP
+    # --- Bear Call Spread (credit): optional delta/prob selection ---
+    if strike_mode == "delta":
+        sc2 = round_to_stride(strike_for_target_call_delta(S,tN,r,q,iv, short_delta), stride)
+        lc2 = round_to_stride(strike_for_target_call_delta(S,tN,r,q,iv, max(wing_delta, min(0.5*short_delta, 0.10))), stride)
+    elif strike_mode == "prob":
+        sc2 = round_to_stride(strike_for_otm_prob(S,tN,r,q,iv, short_tail_prob, is_call=True), stride)
+        lc2 = round_to_stride(strike_for_otm_prob(S,tN,r,q,iv, wing_tail_prob,  is_call=True), stride)
+    else:
+        sc2 = round_to_stride(S + 1.0*emN, stride); lc2 = sc2 + width_from_pct(S, w_bps_pct, stride)
+
     legs=[ make_leg('call','short',sc2,1,tN,iv,0.0,iv), make_leg('call','long',lc2,1,tN,iv,0.0,iv) ]
     finish("BECS","Bear Call Spread","Bearish","credit",legs,"OTM call spread")
 
-    # Bear Put Spread (debit)
-    sp3 = round_to_stride(S - 0.2*emN, stride); lp3 = sp3 - wSP
+    # --- Bear Put Spread (debit): optional delta/prob selection ---
+    if strike_mode == "delta":
+        sp3 = round_to_stride(strike_for_target_put_delta(S,tN,r,q,iv, max(0.30, short_delta)), stride)
+        lp3 = round_to_stride(strike_for_target_put_delta(S,tN,r,q,iv, max(0.60, short_delta + 0.25)), stride)
+    elif strike_mode == "prob":
+        sp3 = round_to_stride(strike_for_otm_prob(S,tN,r,q,iv, max(0.30, short_tail_prob), is_call=False), stride)
+        lp3 = round_to_stride(strike_for_otm_prob(S,tN,r,q,iv, max(0.60, short_tail_prob + 0.25), is_call=False), stride)
+    else:
+        sp3 = round_to_stride(S - 0.2*emN, stride); lp3 = sp3 - width_from_pct(S, w_bps_pct, stride)
+
     legs=[ make_leg('put','long',sp3,1,tN,iv,0.0,iv), make_leg('put','short',lp3,1,tN,iv,0.0,iv) ]
     finish("BEPS","Bear Put Spread","Bearish","debit",legs,"OTM put spread")
 
-    # Call Ratio Backspread (1 short ATM, 2 long OTM calls)
+    # --- Call Ratio Backspread (1 short ATM, 2 long OTM calls) ---
     k_sell = atm; k_buy = round_to_stride(S + 1.0*emN, stride)
     legs=[ make_leg('call','short',k_sell,1,tN,iv,0.0,iv), make_leg('call','long',k_buy,2,tN,iv,0.0,iv) ]
     finish("CRB","Call Ratio Backspread","Bullish","debit",legs,"1× short ATM, 2× long OTM")
 
-    # Put Ratio Backspread
+    # --- Put Ratio Backspread ---
     k_sellp = atm; k_buyp = round_to_stride(S - 1.0*emN, stride)
     legs=[ make_leg('put','short',k_sellp,1,tN,iv,0.0,iv), make_leg('put','long',k_buyp,2,tN,iv,0.0,iv) ]
     finish("PRB","Put Ratio Backspread","Bearish","debit",legs,"1× short ATM, 2× long OTM")
 
-    # Bull/Bear Butterflies (1-2-1)
-    k2 = round_to_stride(S + 0.5*emN, stride); k1 = k2 - wSP; k3 = k2 + wSP
+    # --- Bull/Bear Butterflies (1-2-1) ---
+    k2 = round_to_stride(S + 0.5*emN, stride); k1 = k2 - width_from_pct(S, w_bps_pct, stride); k3 = k2 + width_from_pct(S, w_bps_pct, stride)
     legs=[ make_leg('call','long',k1,1,tN,iv,0.0,iv), make_leg('call','short',k2,2,tN,iv,0.0,iv), make_leg('call','long',k3,1,tN,iv,0.0,iv) ]
     finish("BULL_BFLY","Bull Butterfly (calls)","Bullish","debit",legs,"1-2-1")
 
-    k2p = round_to_stride(S - 0.5*emN, stride); k1p = k2p - wSP; k3p = k2p + wSP
+    k2p = round_to_stride(S - 0.5*emN, stride); k1p = k2p - width_from_pct(S, w_bps_pct, stride); k3p = k2p + width_from_pct(S, w_bps_pct, stride)
     legs=[ make_leg('put','long',k1p,1,tN,iv,0.0,iv), make_leg('put','short',k2p,2,tN,iv,0.0,iv), make_leg('put','long',k3p,1,tN,iv,0.0,iv) ]
     finish("BEAR_BFLY","Bear Butterfly (puts)","Bearish","debit",legs,"1-2-1")
 
-    # Bull/Bear Condors (debit; two verticals)
-    L1 = round_to_stride(S + 0.2*emN, stride); S1 = L1 + wSP; S2 = S1 + wSP; L2 = S2 + wSP
+    # --- Bull/Bear Condors (debit; two verticals) ---
+    L1 = round_to_stride(S + 0.2*emN, stride); S1 = L1 + width_from_pct(S, w_bps_pct, stride)
+    S2 = S1 + width_from_pct(S, w_bps_pct, stride); L2 = S2 + width_from_pct(S, w_bps_pct, stride)
     legs=[ make_leg('call','long',L1,1,tN,iv,0.0,iv), make_leg('call','short',S1,1,tN,iv,0.0,iv),
            make_leg('call','short',S2,1,tN,iv,0.0,iv), make_leg('call','long',L2,1,tN,iv,0.0,iv) ]
     finish("BULL_CONDOR","Bull Condor (calls)","Bullish","debit",legs,"two call spreads")
 
-    pL1 = round_to_stride(S - 0.2*emN, stride); pS1 = pL1 - wSP; pS2 = pS1 - wSP; pL2 = pS2 - wSP
+    pL1 = round_to_stride(S - 0.2*emN, stride); pS1 = pL1 - width_from_pct(S, w_bps_pct, stride)
+    pS2 = pS1 - width_from_pct(S, w_bps_pct, stride); pL2 = pS2 - width_from_pct(S, w_bps_pct, stride)
     legs=[ make_leg('put','long',pL1,1,tN,iv,0.0,iv), make_leg('put','short',pS1,1,tN,iv,0.0,iv),
            make_leg('put','short',pS2,1,tN,iv,0.0,iv), make_leg('put','long',pL2,1,tN,iv,0.0,iv) ]
     finish("BEAR_CONDOR","Bear Condor (puts)","Bearish","debit",legs,"two put spreads")
 
-    # Long Iron Condor / Long Iron Butterfly (debit versions)
-    legs=[ make_leg('put','long',sp,1,tN,iv,0.0,iv), make_leg('put','short',lp,1,tN,iv,0.0,iv),
-           make_leg('call','long',sc,1,tN,iv,0.0,iv), make_leg('call','short',lc,1,tN,iv,0.0,iv) ]
-    finish("LIC","Long Iron Condor","Other","debit",legs,"reverse IC")
-
-    legs=[ make_leg('put','long',atm,1,tN,iv,0.0,iv), make_leg('put','short',atm-wIC,1,tN,iv,0.0,iv),
-           make_leg('call','long',atm,1,tN,iv,0.0,iv), make_leg('call','short',atm+wIC,1,tN,iv,0.0,iv) ]
+    # --- Long Iron Condor / Long Iron Butterfly (debit versions) ---
+    legs=[ make_leg('put','long',atm,1,tN,iv,0.0,iv), make_leg('put','short',lp_ib,1,tN,iv,0.0,iv),
+           make_leg('call','long',atm,1,tN,iv,0.0,iv), make_leg('call','short',lc_ib,1,tN,iv,0.0,iv) ]
     finish("LIB","Long Iron Butterfly","Other","debit",legs,"reverse IB")
 
-    # Jade Lizard: short put + short call + long higher call (ensure credit ≥ call width)
+
+    # --- Jade Lizard: short put + short call + long higher call (ensure credit ≥ call width) ---
     sp_j = round_to_stride(S - 0.7*emN, stride)
     sc_j = round_to_stride(S + 0.7*emN, stride)
+    wSP = width_from_pct(S, w_bps_pct, stride)
     lc_j = sc_j + wSP
     jl_legs=[ make_leg('put','short',sp_j,1,tN,iv,0.0,iv), make_leg('call','short',sc_j,1,tN,iv,0.0,iv), make_leg('call','long',lc_j,1,tN,iv,0.0,iv) ]
     credit = sum(price_leg_entry(S, r, q, L) for L in jl_legs)
@@ -381,20 +613,19 @@ def build_strategies_full(S: float, iv: float, iv2: Optional[float], days_near: 
         jl_legs[-1] = make_leg('call','long',lc_j,1,tN,iv,0.0,iv)
     finish("JL","Jade Lizard","Bullish","credit",jl_legs,"no upside risk if credit ≥ call width")
 
-    # Risk Reversal / Range Forward (near zero-cost hedge)
+    # --- Risk Reversal / Range Forward (near zero-cost hedge) ---
     k_call = round_to_stride(S + 0.6*emN, stride); k_put = round_to_stride(S - 0.6*emN, stride)
     rr_legs=[ make_leg('call','long',k_call,1,tN,iv,0.0,iv), make_leg('put','short',k_put,1,tN,iv,0.0,iv) ]
     finish("RR","Risk Reversal (Range Forward)","Other","other",rr_legs,"near zero-cost directional hedge")
 
-    # Strip / Strap (ATM)
+    # --- Strip / Strap (ATM) ---
     strip=[ make_leg('put','long',atm,2,tN,iv,0.0,iv), make_leg('call','long',atm,1,tN,iv,0.0,iv) ]
     finish("STRIP","Strip (2P+1C @ATM)","Other","debit",strip,"bearish long-vol tilt")
     strap=[ make_leg('call','long',atm,2,tN,iv,0.0,iv), make_leg('put','long',atm,1,tN,iv,0.0,iv) ]
     finish("STRAP","Strap (2C+1P @ATM)","Other","debit",strap,"bullish long-vol tilt")
 
-    # Batman (two narrow flies around ±d) & Double Plateau (two narrow condors)
+    # --- Batman (two narrow flies around ±d) & Double Plateau (two narrow condors) ---
     d = 0.7*emN; wing = max(suggest_stride(S), stride)
-    # Batman
     bat_legs=[]
     for sign in (+1, -1):
         k2b = round_to_stride(S + sign*d, stride); k1b=k2b-wing; k3b=k2b+wing
@@ -403,7 +634,6 @@ def build_strategies_full(S: float, iv: float, iv2: Optional[float], days_near: 
                       make_leg('call','long',k3b,1,tN,iv,0.0,iv) ]
     finish("BATMAN","Batman (double butterfly)","Neutral","debit",bat_legs,"two flies around ±0.7σ")
 
-    # Double Plateau
     dp_legs=[]
     for sign in (+1, -1):
         mid = round_to_stride(S + sign*d, stride)
@@ -607,8 +837,9 @@ function bsGreeks(S,K,t,r,sigma,q,type){
   else delta = Math.exp(-q*t)*(Nd1-1);
   const gamma = (Math.exp(-q*t)*pdf)/(S*sigma*Math.sqrt(t));
   const theta = -(S*Math.exp(-q*t)*pdf*sigma)/(2*Math.sqrt(t))
-                - (type==='call' ? ( -q*S*Math.exp(-q*t)*Nd1 + r*K*Math.exp(-r*t)*Nd2 )
-                                 : ( -q*S*Math.exp(-q*t)*(Nd1-1) + r*K*Math.exp(-r*t)*cdf(-d2) ));
+              - (type==='call'
+                   ? ( -q*S*Math.exp(-q*t)*Nd1 + r*K*Math.exp(-r*t)*Nd2 )
+                   : ( -q*S*Math.exp(-q*t)*(Nd1-1) - r*K*Math.exp(-r*t)*cdf(-d2) ));
   const vega  = S*Math.exp(-q*t)*pdf*Math.sqrt(t);
   return {delta, gamma, theta_per_year:theta, vega};
 }
@@ -752,16 +983,15 @@ function styleEmoji(style){
   return '🧭';
 }
 function beSpanInfo(s){
-  // span across BOTH breakevens in units of σ-range (2*em)
   if (s.be_low!=null && s.be_high!=null && isFinite(s.be_low) && isFinite(s.be_high) && CUR && isFinite(CUR.em) && CUR.em>0){
     const span = (s.be_high - s.be_low)/(2*CUR.em);
     return {label: 'Width '+span.toFixed(2)+'σ', val: span};
   }
-  if (s.be_low!=null || s.be_high!=null) return {label: '1-side BE', val: 0.4}; // neutral mid rating
+  if (s.be_low!=null || s.be_high!=null) return {label: '1-side BE', val: 0.4};
   return {label: 'No BE', val: 0.0};
 }
 
-/* --------- Strategy list renderer (friendlier rows + new badges) --------- */
+/* --------- Strategy list renderer --------- */
 function renderStrategyList(){
   strategyList.innerHTML='';
   const arr = allStratsBestFirst();
@@ -794,7 +1024,7 @@ function renderStrategyList(){
   });
 }
 
-/* --------- Legend & toggles (for chart overlays) --------- */
+/* --------- Legend & toggles --------- */
 function renderLegend(){
   legend.innerHTML='';
   const base = SHOW_ALL ? CUR.all : allStratsBestFirst();
@@ -969,7 +1199,25 @@ def main():
     ap.add_argument("--html_out", type=str, default="iv_agent_output.html")
     ap.add_argument("--open_html", action="store_true")
     ap.add_argument("--verbose", action="store_true")
+
+    # NEW: strike selection knobs
+    ap.add_argument("--strike_mode", type=str, default="sigma",
+                    choices=["sigma","delta","prob","ev"],
+                    help="sigma=±k·σ; delta=target |Δ|; prob=tail probs; ev=optimize IC EV")
+    ap.add_argument("--short_delta", type=float, default=0.18, help="|Δ| for short strikes (delta mode)")
+    ap.add_argument("--wing_delta",  type=float, default=0.05, help="|Δ| for long wings (delta mode)")
+    ap.add_argument("--short_tail_prob", type=float, default=0.18, help="Tail prob for shorts (prob mode)")
+    ap.add_argument("--wing_tail_prob",  type=float, default=0.05, help="Tail prob for wings (prob mode)")
+    ap.add_argument("--ev_k_sigma_grid", type=str, default="0.8,1.0,1.2,1.4",
+                    help="CSV of k multipliers for short strikes relative to σ (ev mode)")
+    ap.add_argument("--ev_width_pct_grid", type=str, default="0.01,0.015,0.02,0.025",
+                    help="CSV of widths (as % of spot) for condor wings (ev mode)")
+
     args = ap.parse_args()
+
+    # Parse EV grids
+    ev_k_list = [float(x) for x in (args.ev_k_sigma_grid or "").split(",") if x.strip()]
+    ev_w_list = [float(x) for x in (args.ev_width_pct_grid or "").split(",") if x.strip()]
 
     tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
     lots = fetch_lot_sizes()
@@ -1021,7 +1269,11 @@ def main():
             args.risk_free, args.yield_div, stride,
             args.sigma_ic, args.sigma_bps, args.sigma_ls,
             args.width_pct_ic, args.width_pct_bps,
-            args.allow_naked
+            args.allow_naked,
+            args.strike_mode,
+            args.short_delta, args.wing_delta,
+            args.short_tail_prob, args.wing_tail_prob,
+            ev_k_list, ev_w_list
         )
 
         # Score & pick top N
@@ -1059,6 +1311,7 @@ def main():
                 "Max Profit (₹/lot)": "Uncapped" if maxp_lot is None else f"{maxp_lot:.2f}",
                 "Max Loss (₹/lot)": "" if maxl_lot is None else f"{maxl_lot:.2f}",
                 "PnL @ Spot (₹/lot)": f"{pnl_at_spot_lot:.2f}",
+                "StrikeMode": getattr(args, "strike_mode", "sigma"),
             })
 
         # Website payload
