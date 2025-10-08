@@ -991,26 +991,54 @@ function legsToSummary(legs){ return legs.map(legText).join(', '); }
 const DATA = __DATA_JSON__;
 const TOPN = __TOPN__;
 const POP_MODEL = "__POP_MODEL__";
-const cards = document.getElementById('cards');
-document.getElementById('q').addEventListener('input', e=>{
-  const t=e.target.value.toLowerCase();
-  Array.from(cards.children).forEach(c=>{c.style.display=c.textContent.toLowerCase().includes(t)?'':''})
-});
-DATA.forEach((d,i)=>{
-  const card=document.createElement('div');card.className='card';card.onclick=()=>openDetail(i);
-  const ivStr = (d.iv!=null && isFinite(d.iv)) ? (d.iv*100).toFixed(1)+'%' : '—';
-  const pillText = (d.top && d.top.length) ? d.top.map(x=>x.name).join(' · ') : 'No strategies';
-  card.innerHTML=`<div class="sym">${d.symbol}</div>
-  <div class="row"><span>Spot</span><span>₹${(+d.spot).toFixed(2)}</span></div>
-  <div class="row"><span>IV (near)</span><span>${ivStr}</span></div>`;
-  const p=document.createElement('div');p.className='pill';p.textContent=pillText;
-  card.appendChild(p); cards.appendChild(card);
+
+// DOM elements
+const detail=document.getElementById('detail');
+const d_sym=document.getElementById('d_sym'); 
+const d_meta=document.getElementById('d_meta');
+const tblBody = document.querySelector('#tbl tbody');
+
+function openDetail(i){
+  const d=DATA[i];
+  d_sym.textContent=d.symbol;
+  d_meta.innerHTML=`Spot: ₹${(+d.spot).toFixed(2)} | IV: ${(d.iv*100).toFixed(1)}% | Lot: ${d.lot}`;
+  tblBody.innerHTML='';
+  (d.top||[]).forEach(s=>{
+    const row=document.createElement('tr');
+    row.innerHTML=`<td>${s.name}</td><td>${s.group}</td><td>${s.style}</td><td>${(s.pop*100).toFixed(1)}%</td><td>${s.roi?((s.roi*100).toFixed(1)+'%'):'—'}</td><td>${legsToSummary(s.legs)}</td>`;
+    tblBody.appendChild(row);
+  });
+  detail.style.display='block';
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+  const cards = document.getElementById('cards');
+  if (!cards) {
+    console.error('Cards element not found');
+    return;
+  }
+  
+  document.getElementById('q').addEventListener('input', e=>{
+    const t=e.target.value.toLowerCase();
+    Array.from(cards.children).forEach(c=>{c.style.display=c.textContent.toLowerCase().includes(t)?'block':'none'})
+  });
+  
+  DATA.forEach((d,i)=>{
+    const card=document.createElement('div');card.className='card';card.onclick=()=>openDetail(i);
+    const ivStr = (d.iv!=null && isFinite(d.iv)) ? (d.iv*100).toFixed(1)+'%' : '—';
+    const pillText = (d.top && d.top.length) ? d.top.map(x=>x.name).join(' · ') : 'No strategies';
+    card.innerHTML=`<div class="sym">${d.symbol}</div>
+    <div class="row"><span>Spot</span><span>₹${(+d.spot).toFixed(2)}</span></div>
+    <div class="row"><span>IV (near)</span><span>${ivStr}</span></div>`;
+    const p=document.createElement('div');p.className='pill';p.textContent=pillText;
+    card.appendChild(p); cards.appendChild(card);
+  });
+  
+  console.log('Cards rendered:', cards.children.length);
 });
 
 /* ---------- Panel refs ---------- */
-const detail=document.getElementById('detail');
-const d_sym=document.getElementById('d_sym'); const d_meta=document.getElementById('d_meta');
-const tblBody = document.querySelector('#tbl tbody');
+// DOM elements moved to top of script
 const riskBody = document.querySelector('#riskTbl tbody');
 const legend=document.getElementById('legend'); const tabs=document.getElementById('tabs');
 const toggleAll=document.getElementById('toggleAll');
@@ -1024,36 +1052,7 @@ const dlGreeksBtn = document.getElementById('dlGreeks');
 
 let CUR=null, SHOW_ALL=false, selKeys=[], activeKey=null;
 
-function openDetail(i){
-  CUR=DATA[i];
-  if (!CUR || !Array.isArray(CUR.all) || CUR.all.length===0) {
-    d_sym.textContent = CUR?.symbol || '—';
-    d_meta.textContent=`Lot: ${CUR?.lot||'—'} · Spot: ₹${(CUR?.spot||0).toFixed(2)} · No strategies computed · POP model: ${POP_MODEL}`;
-    strategyList.innerHTML = '';
-    legend.innerHTML = '';
-    tblBody.innerHTML = '<tr><td colspan="5">No strategies available for this symbol.</td></tr>';
-    riskBody.innerHTML = '<tr><td colspan="3">—</td></tr>';
-    greeksBody.innerHTML = '<tr><td colspan="4">—</td></tr>';
-    pnlBody.innerHTML = '<tr><td colspan="3">—</td></tr>';
-    ordersBox.textContent = '—';
-    detail.style.display='flex';
-    renderTabs(); draw();
-    return;
-  }
-  const bestKey = (CUR.top && CUR.top[0]) ? CUR.top[0].key : CUR.all[0].key;
-  activeKey = bestKey; selKeys=[bestKey]; SHOW_ALL=false;
-
-  d_sym.textContent=CUR.symbol;
-  const ivx = (CUR.iv2!=null && isFinite(CUR.iv2)) ? (' · IVx '+(CUR.iv2*100).toFixed(1)+'%') : '';
-  d_meta.textContent=`Expiry near: ${CUR.exp_near||'—'} · next: ${CUR.exp_next||'—'} · Lot: ${CUR.lot} · Spot: ₹${(+CUR.spot).toFixed(2)} · IVn ${(CUR.iv*100).toFixed(1)}%${ivx} · POP model: ${POP_MODEL}`;
-
-  renderStrategyList();
-  renderTabs();
-  renderLegend();
-  updateSelectedDetail();
-  draw();
-  detail.style.display='flex';
-}
+// openDetail function moved to top of script for better accessibility
 function closeDetail(){ detail.style.display='none'; }
 
 function colorFor(i){return ['#60a5fa','#34d399','#fbbf24','#f472b6','#22d3ee','#e5e7eb'][i%6];}
@@ -1266,9 +1265,30 @@ def legs_summary(legs: List[Leg]) -> str:
 
 # ------------------------------------ CLI ------------------------------------
 
+def check_dependencies():
+    """Check if required dependencies are available."""
+    missing_deps = []
+    
+    try:
+        import requests
+    except ImportError:
+        missing_deps.append("requests")
+    
+    try:
+        import yfinance
+    except ImportError:
+        missing_deps.append("yfinance")
+    
+    if missing_deps:
+        print(f"ERROR: Missing required dependencies: {', '.join(missing_deps)}")
+        print("Install them with: pip install requests yfinance")
+        return False
+    
+    return True
+
 def main():
     ap = argparse.ArgumentParser(description="IV Agent – Full strategy set with ranking + website")
-    ap.add_argument("--tickers", required=True, type=str)
+    ap.add_argument("--tickers", type=str, default="RELIANCE,ICICIBANK,SBIN,TCS,INFY")
     ap.add_argument("--days", type=int, default=30)  # target for NEAR expiry
     ap.add_argument("--risk_free", type=float, default=0.07)
     ap.add_argument("--yield_div", type=float, default=0.00)
@@ -1280,14 +1300,14 @@ def main():
     ap.add_argument("--default_iv", type=float, default=0.25)
     ap.add_argument("--iv_csv", type=str, default="")
     ap.add_argument("--spot_csv", type=str, default="")
-    ap.add_argument("--live_iv", action="store_true")
-    ap.add_argument("--use_yfinance_fallback", action="store_true")
-    ap.add_argument("--allow_naked", action="store_true")
+    ap.add_argument("--live_iv", action="store_true", help="Fetch live IV from NSE")
+    ap.add_argument("--use_yfinance_fallback", action="store_true", help="Use yfinance as fallback")
+    ap.add_argument("--allow_naked", action="store_true", help="Allow naked short strategies")
     ap.add_argument("--top_n", type=int, default=3)
     ap.add_argument("--out_csv", type=str, default="iv_agent_output.csv")
     ap.add_argument("--html_out", type=str, default="iv_agent_output.html")
-    ap.add_argument("--open_html", action="store_true")
-    ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--open_html", action="store_true", help="Open HTML in browser")
+    ap.add_argument("--verbose", action="store_true", help="Verbose output")
 
     # NEW: strike selection knobs
     ap.add_argument("--strike_mode", type=str, default="sigma",
@@ -1308,6 +1328,24 @@ def main():
     ap.add_argument("--profile", type=str, default="", help="JSON file with default args (CLI overrides)")
 
     args = ap.parse_args()
+    
+    # Set default behavior for direct execution (no CLI args)
+    if len(sys.argv) == 1:  # Only script name, no arguments
+        args.live_iv = True
+        args.use_yfinance_fallback = True
+        args.open_html = True
+        print("Running with default settings (live data + yfinance fallback + auto-open)")
+    
+    # Check dependencies first
+    if not check_dependencies():
+        return 1
+    
+    print("IV Agent - Options Strategy Analyzer")
+    print("=" * 50)
+    print(f"Analyzing: {args.tickers}")
+    print(f"Target days: {args.days}")
+    print(f"Top strategies: {args.top_n}")
+    print("=" * 50)
 
     # Load profile defaults (CLI overrides)
     if args.profile:
@@ -1335,16 +1373,36 @@ def main():
     rows_csv: List[Dict[str,str]] = []
     js_rows: List[dict] = []
 
-    for sym in tickers:
+    for i, sym in enumerate(tickers, 1):
+        print(f"Processing {sym} ({i}/{len(tickers)})...")
         lot = lots.get(normalize_symbol_key(sym), 1)
 
         spot=None; exp_near=None; exp_next=None; iv_near=None; iv_next=None
+        
+        # Try to fetch live data first
         if args.live_iv:
-            spot, exp_near, exp_next, iv_near, iv_next = fetch_live(sym, args.days)
-        if spot is None: spot = spot_map.get(sym)
-        if iv_near is None: iv_near = iv_map.get(sym, args.default_iv)
+            try:
+                spot, exp_near, exp_next, iv_near, iv_next = fetch_live(sym, args.days)
+                if spot:
+                    print(f"  Live data: Spot Rs.{spot:.2f}, IV {iv_near*100:.1f}%")
+            except Exception as e:
+                if args.verbose: print(f"  NSE API failed: {e}")
+        
+        # Fallback to CSV data
+        if spot is None: 
+            spot = spot_map.get(sym)
+            if spot:
+                print(f"  Using CSV spot: Rs.{spot:.2f}")
+        
+        if iv_near is None: 
+            iv_near = iv_map.get(sym, args.default_iv)
+            if iv_near:
+                print(f"  Using CSV IV: {iv_near*100:.1f}%")
+        
         if iv_near and iv_near>1.0: iv_near/=100.0
         if iv_next and iv_next>1.0: iv_next/=100.0
+        
+        # Final fallback to yfinance
         if spot is None:
             if args.use_yfinance_fallback:
                 try:
@@ -1353,9 +1411,12 @@ def main():
                     data = yf.Ticker(s).history(period="1d")
                     if data is not None and not data.empty:
                         spot = float(data["Close"].iloc[-1])
-                except Exception: pass
+                        print(f"  yfinance fallback: Spot Rs.{spot:.2f}")
+                except Exception as e:
+                    if args.verbose: print(f"  yfinance failed: {e}")
+        
         if spot is None:
-            if args.verbose: print(f"[SKIP] {sym}: no spot")
+            print(f"  Skipping {sym}: no spot price available")
             continue
 
         # times
@@ -1447,9 +1508,23 @@ def main():
         })
 
     if not js_rows:
-        print("No data generated. Check symbols/connectivity."); sys.exit(2)
+        print("\nERROR: No data generated!")
+        print("Troubleshooting tips:")
+        print("  - Check internet connection for NSE API access")
+        print("  - Try running with --use_yfinance_fallback")
+        print("  - Verify ticker symbols are correct")
+        print("  - Run with --verbose for detailed error messages")
+        return 1
 
-    write_csv(args.out_csv, rows_csv)
+    print(f"\nSaving results...")
+    try:
+        write_csv(args.out_csv, rows_csv)
+    except PermissionError:
+        print(f"WARNING: Cannot write to {args.out_csv} (file may be open in another program)")
+        print("Trying alternative filename...")
+        alt_csv = f"iv_agent_output_{int(time.time())}.csv"
+        write_csv(alt_csv, rows_csv)
+        args.out_csv = alt_csv
 
     html = (HTML
             .replace("__GENERATED__", dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -1461,12 +1536,40 @@ def main():
             .replace("__POP_MODEL__", args.pop_model)
             .replace("__DATA_JSON__", json.dumps(js_rows, ensure_ascii=False))
             )
-    with open(args.html_out, "w", encoding="utf-8") as f:
-        f.write(html)
+    try:
+        with open(args.html_out, "w", encoding="utf-8") as f:
+            f.write(html)
+    except PermissionError:
+        print(f"WARNING: Cannot write to {args.html_out} (file may be open in another program)")
+        print("Trying alternative filename...")
+        alt_html = f"iv_agent_output_{int(time.time())}.html"
+        with open(alt_html, "w", encoding="utf-8") as f:
+            f.write(html)
+        args.html_out = alt_html
 
-    print(f"Saved CSV : {os.path.abspath(args.out_csv)}")
-    print(f"Saved HTML: {os.path.abspath(args.html_out)}")
-    if args.open_html: webbrowser.open("file://" + os.path.abspath(args.html_out))
+    print("SUCCESS!")
+    print("=" * 50)
+    print(f"Processed {len(js_rows)} symbols")
+    print(f"CSV file: {os.path.abspath(args.out_csv)}")
+    print(f"HTML file: {os.path.abspath(args.html_out)}")
+    print("=" * 50)
+    
+    if args.open_html: 
+        print("Opening HTML in browser...")
+        webbrowser.open("file://" + os.path.abspath(args.html_out))
+    
+    return 0
 
 if __name__ == "__main__":
-    main()
+    try:
+        exit_code = main()
+        sys.exit(exit_code)
+    except KeyboardInterrupt:
+        print("\n\nExecution interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\nUnexpected error: {e}")
+        if "--verbose" in sys.argv:
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
