@@ -784,9 +784,8 @@ HTML = r"""<!doctype html>
   .sub{color:var(--muted);font-size:14px}
   .close{background:#25365e;border:1px solid #334876;color:#dbe4ff;border-radius:10px;padding:8px 10px;cursor:pointer}
 
-  /* Layout: left = strategy list; right = strategy detail; chart comes AFTER details */
-  .cols{display:grid;grid-template-columns:0.95fr 1.05fr;gap:18px}
-  @media (max-width:1024px){.cols{grid-template-columns:1fr}}
+  /* Layout: full width strategy details */
+  .cols{display:block}
   .box{background:#0e1933;border:1px solid #1c2a51;border-radius:14px;padding:14px}
 
   /* Strategy list (user friendly) */
@@ -817,6 +816,22 @@ HTML = r"""<!doctype html>
   .chip.active{outline:2px solid #2f4aa8}
   .tab{display:inline-block;margin:0 8px 8px 0;padding:8px 12px;border-radius:999px;background:#14203f;border:1px solid #233463;cursor:pointer}
   .tab.active{outline:2px solid #2f4aa8}
+  
+  /* Strategy Summary Styles */
+  .strategy-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;margin-top:8px}
+  .strategy-card{background:#0f1835;border:1px solid #233463;border-radius:12px;padding:16px;transition:border-color .2s}
+  .strategy-card:hover{border-color:#2f4aa8}
+  .strategy-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+  .strategy-name{font-weight:700;font-size:16px;color:#e8ecf6}
+  .strategy-group{font-size:12px;padding:4px 8px;border-radius:12px;background:#1a2747;color:#a4afc6}
+  .strategy-metrics{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px}
+  .metric{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #1e2846}
+  .metric:last-child{border-bottom:none}
+  .metric-label{color:#a4afc6;font-size:13px}
+  .metric-value{color:#e8ecf6;font-weight:600;font-size:13px}
+  .metric-value.positive{color:#16a34a}
+  .metric-value.negative{color:#ef4444}
+  .strategy-notes{font-size:12px;color:#a4afc6;font-style:italic;margin-top:8px;padding-top:8px;border-top:1px solid #1e2846}
 </style>
 </head>
 <body>
@@ -835,13 +850,7 @@ HTML = r"""<!doctype html>
     </div>
 
     <div class="cols">
-      <!-- LEFT: Recommended list -->
-      <div class="box">
-        <div style="margin-bottom:8px;color:#cbd5e1"><b>Recommended (best first)</b> · click to view details</div>
-        <div id="strategyList" class="slist"></div>
-      </div>
-
-      <!-- RIGHT: Details first -->
+      <!-- Strategy Details -->
       <div>
         <div class="box">
           <div style="margin-bottom:8px;color:#cbd5e1"><b>Selected strategy</b></div>
@@ -875,12 +884,10 @@ HTML = r"""<!doctype html>
           </div>
         </div>
 
-        <!-- THEN: payoff chart + legend -->
+        <!-- Strategy Performance Summary -->
         <div class="box" style="margin-top:14px">
-          <div id="tabs"></div>
-          <canvas id="chart" width="1000" height="380"></canvas>
-          <div class="legend" id="legend"></div>
-          <div style="margin-top:8px"><span id="toggleAll" class="tab">Show all strategies</span></div>
+          <div style="margin-bottom:12px;color:#cbd5e1"><b>Strategy Performance Summary</b></div>
+          <div id="strategySummary" class="strategy-summary"></div>
         </div>
       </div>
     </div>
@@ -1000,14 +1007,124 @@ const tblBody = document.querySelector('#tbl tbody');
 
 function openDetail(i){
   const d=DATA[i];
+  CUR = d;
   d_sym.textContent=d.symbol;
   d_meta.innerHTML=`Spot: ₹${(+d.spot).toFixed(2)} | IV: ${(d.iv*100).toFixed(1)}% | Lot: ${d.lot}`;
-  tblBody.innerHTML='';
+  
+  // Show the first strategy details in the main panel
+  if (d.top && d.top.length > 0) {
+    const s = d.top[0];
+    selName.textContent = `${s.name} (${s.group})`;
+    
+    // Orders section
+    const lines = s.legs.map(L=>legText(L));
+    const cdSh = s.prem0_sh;
+    const cdLot = cdSh * d.lot;
+    ordersBox.textContent = `• ${s.name}\n  ${lines.join('\n  ')}\n  Net premium (₹/sh): ${(cdSh>=0?'+':'')}${cdSh.toFixed(2)}  |  (₹/lot): ${(cdLot).toFixed(2)}`;
+
+    // Main metrics table
+    const be = fmt(s.be_low)+' / '+fmt(s.be_high);
+    const maxp_lot = s.max_profit_sh==null ? 'Uncapped' : (s.max_profit_sh*d.lot).toFixed(2);
+    const maxl_lot = s.max_loss_sh==null ? '—' : (s.max_loss_sh*d.lot).toFixed(2);
+    const roi = s.roi==null? '—' : (s.roi*100).toFixed(1);
+    const pop = s.pop==null? '—' : (s.pop*100).toFixed(1);
+    tblBody.innerHTML='';
+    const tr=document.createElement('tr');
+    tr.innerHTML = `<td>${(cdSh>=0?'+':'')+cdSh.toFixed(2)} / ${cdLot.toFixed(2)}</td><td>${be}</td><td>${maxp_lot} · ${maxl_lot}</td><td>${roi}</td><td>${pop}</td>`;
+    tblBody.appendChild(tr);
+
+    // Risk metrics
+    const ev_lot = (s.ev_sh==null)? '—' : (s.ev_sh*d.lot).toFixed(2);
+    const evm_pct = (s.ev_margin_ratio==null)? '—' : (s.ev_margin_ratio*100).toFixed(1);
+    const cvar_lot = (s.cvar5_sh==null)? '—' : (s.cvar5_sh*d.lot).toFixed(2);
+    riskBody.innerHTML = `<tr><td>${ev_lot}</td><td>${evm_pct}</td><td>${cvar_lot}</td></tr>`;
+
+    // Greeks
+    const g = aggregateGreeksPerLot(d.spot, 0.07, 0.0, s, d.lot);
+    const gRow = formatGreeksRow(g);
+    greeksBody.innerHTML = `<tr><td>${gRow[0]}</td><td>${gRow[1]}</td><td>${gRow[2]}</td><td>${gRow[3]}</td></tr>`;
+
+    // P&L Table
+    const pts = keyPointsForPnL(d.spot, d.em, s);
+    const f = (ST)=>payoffFromLegs(ST, s.legs, s.prem0_sh);
+    pnlBody.innerHTML='';
+    pts.forEach(p=>{
+      const v = f(p.x);
+      const tr=document.createElement('tr');
+      tr.innerHTML = `<td>₹${p.x.toFixed(2)}</td><td>${p.label}</td><td>${v.toFixed(2)}</td>`;
+      pnlBody.appendChild(tr);
+    });
+
+    // Download buttons
+    dlPnlBtn.onclick = ()=>{
+      const rows=[['Price','Label','Payoff (₹/lot)']];
+      pts.forEach(p=>rows.push([p.x.toFixed(2), p.label, f(p.x).toFixed(2)]));
+      downloadCSV(rows, `${d.symbol}_${s.key}_pnl.csv`);
+    };
+    dlGreeksBtn.onclick = ()=>{
+      const rows=[['Delta','Gamma','Theta/day','Vega']];
+      rows.push(gRow);
+      downloadCSV(rows, `${d.symbol}_${s.key}_greeks.csv`);
+    };
+  }
+  
+  // Clear and populate strategy summary
+  strategySummary.innerHTML='';
   (d.top||[]).forEach(s=>{
-    const row=document.createElement('tr');
-    row.innerHTML=`<td>${s.name}</td><td>${s.group}</td><td>${s.style}</td><td>${(s.pop*100).toFixed(1)}%</td><td>${s.roi?((s.roi*100).toFixed(1)+'%'):'—'}</td><td>${legsToSummary(s.legs)}</td>`;
-    tblBody.appendChild(row);
+    const card = document.createElement('div');
+    card.className='strategy-card';
+    
+    const header = document.createElement('div');
+    header.className='strategy-header';
+    header.innerHTML=`<div class="strategy-name">${s.name}</div><div class="strategy-group">${s.group}</div>`;
+    
+    const metrics = document.createElement('div');
+    metrics.className='strategy-metrics';
+    
+    const popValue = s.pop ? (s.pop*100).toFixed(1) + '%' : '—';
+    const roiValue = s.roi ? (s.roi*100).toFixed(1) + '%' : '—';
+    const maxProfit = s.max_profit_sh ? '₹' + (s.max_profit_sh*d.lot).toFixed(0) : 'Unlimited';
+    const maxLoss = s.max_loss_sh ? '₹' + (s.max_loss_sh*d.lot).toFixed(0) : '—';
+    const premium = s.prem0_sh ? '₹' + (s.prem0_sh*d.lot).toFixed(0) : '—';
+    const ev = s.ev_sh ? '₹' + (s.ev_sh*d.lot).toFixed(0) : '—';
+    
+    metrics.innerHTML=`
+      <div class="metric">
+        <span class="metric-label">Probability of Profit</span>
+        <span class="metric-value ${s.pop && s.pop > 0.6 ? 'positive' : ''}">${popValue}</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Return on Investment</span>
+        <span class="metric-value ${s.roi && s.roi > 0 ? 'positive' : ''}">${roiValue}</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Max Profit</span>
+        <span class="metric-value positive">${maxProfit}</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Max Loss</span>
+        <span class="metric-value negative">${maxLoss}</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Premium (₹/lot)</span>
+        <span class="metric-value">${premium}</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Expected Value</span>
+        <span class="metric-value ${s.ev_sh && s.ev_sh > 0 ? 'positive' : 'negative'}">${ev}</span>
+      </div>
+    `;
+    
+    const notes = document.createElement('div');
+    notes.className='strategy-notes';
+    notes.textContent = s.notes || '';
+    
+    card.appendChild(header);
+    card.appendChild(metrics);
+    card.appendChild(notes);
+    strategySummary.appendChild(card);
   });
+  
   detail.style.display='block';
 }
 
@@ -1040,8 +1157,7 @@ document.addEventListener('DOMContentLoaded', function() {
 /* ---------- Panel refs ---------- */
 // DOM elements moved to top of script
 const riskBody = document.querySelector('#riskTbl tbody');
-const legend=document.getElementById('legend'); const tabs=document.getElementById('tabs');
-const toggleAll=document.getElementById('toggleAll');
+const strategySummary = document.getElementById('strategySummary');
 const strategyList = document.getElementById('strategyList');
 const ordersBox = document.getElementById('ordersBody');
 const selName = document.getElementById('selName');
@@ -1076,55 +1192,9 @@ function beSpanInfo(s){
   return {label: 'No BE', val: 0.0};
 }
 
-function renderStrategyList(){
-  strategyList.innerHTML='';
-  const arr = allStratsBestFirst();
-  arr.forEach((s,idx)=>{
-    const item=document.createElement('div'); item.className='sitem'+(activeKey===s.key?' active':'');
-    const left=document.createElement('div'); left.className='sleft';
-    const dot=document.createElement('span'); dot.className='dot'; dot.style.background=colorFor(idx);
-    const sname=document.createElement('div'); sname.className='sname'; sname.textContent=`${styleEmoji(s.style)} ${s.name}`;
-    const stags=document.createElement('div'); stags.className='stags'; stags.textContent=s.group+' · '+(s.style||'');
-    left.appendChild(dot); left.appendChild(sname); left.appendChild(stags);
+// Removed renderStrategyList function - not needed for new interface
 
-    const right=document.createElement('div'); right.className='sright';
-    const pop=document.createElement('span'); pop.className='badge '+((s.pop||0)>=0.6?'ok':((s.pop||0)>=0.5?'':'warn'));
-    pop.textContent = 'POP ' + (s.pop==null?'—':(s.pop*100).toFixed(0)) + '%';
-    const roi=document.createElement('span'); roi.className='badge'; roi.textContent='ROI ' + (s.roi==null?'—':(s.roi*100).toFixed(0)) + '%';
-    const spanInfo = beSpanInfo(s);
-    const spanBadge=document.createElement('span');
-    spanBadge.className='badge ' + (spanInfo.val>=1.0 ? 'ok' : (spanInfo.val<0.6 ? 'warn' : ''));
-    spanBadge.textContent = spanInfo.label;
-
-    right.appendChild(pop); right.appendChild(roi); right.appendChild(spanBadge);
-
-    item.appendChild(left); item.appendChild(right);
-    item.onclick=()=>{ activeKey=s.key; selKeys=[s.key]; SHOW_ALL=false; 
-      Array.from(strategyList.children).forEach(el=>el.classList.remove('active')); item.classList.add('active');
-      renderLegend(); updateSelectedDetail(); draw(); 
-    };
-    strategyList.appendChild(item);
-  });
-}
-
-function renderLegend(){
-  legend.innerHTML='';
-  const base = SHOW_ALL ? CUR.all : allStratsBestFirst();
-  base.forEach((s,i)=>{
-    const chip=document.createElement('span');chip.className='chip'+(selKeys.includes(s.key)?' active':'');
-    chip.innerHTML=`<span style="width:10px;height:10px;border-radius:50%;background:${colorFor(i)}"></span>${styleEmoji(s.style)} ${s.name}`;
-    chip.onclick=()=>{ 
-      if(selKeys.includes(s.key)) selKeys=selKeys.filter(k=>k!==s.key);
-      else selKeys.push(s.key);
-      if (!selKeys.length) selKeys=[base[0].key];
-      activeKey = selKeys[0];
-      updateSelectedDetail(); draw(); renderLegend();
-    };
-    legend.appendChild(chip);
-  });
-  toggleAll.textContent = SHOW_ALL ? 'Show only best/selected' : 'Show all strategies';
-  toggleAll.onclick=()=>{ SHOW_ALL=!SHOW_ALL; renderLegend(); draw(); };
-}
+// Removed renderLegend function - not needed for new interface
 
 function fmt(x){return x==null?'—':(typeof x==='number'?x.toFixed(2):x);}
 
@@ -1177,47 +1247,11 @@ function updateSelectedDetail(){
   dlGreeksBtn.onclick = ()=>{
     const rows=[['Delta','Gamma','Theta/day','Vega']];
     rows.push(gRow);
-    downloadCSV(rows, `${CUR.symbol_${'+'}s.key}_greeks.csv`);
+    downloadCSV(rows, `${CUR.symbol}_${s.key}_greeks.csv`);
   };
 }
 
-function renderTabs(){
-  tabs.innerHTML='';
-  ['±1σ','±1.5σ','±2σ'].forEach((t,idx)=>{
-    const span=document.createElement('span');span.className='tab'+(idx==0?' active':'');span.textContent=t;span.dataset.m=[1,1.5,2][idx];
-    span.onclick=(e)=>{Array.from(tabs.children).forEach(c=>c.classList.remove('active')); e.target.classList.add('active'); draw(parseFloat(e.target.dataset.m));}
-    tabs.appendChild(span);
-  });
-}
-
-function draw(mult=1.0){
-  const c=document.getElementById('chart'); const ctx=c.getContext('2d'); ctx.clearRect(0,0,c.width,c.height);
-  const source = SHOW_ALL ? CUR.all : CUR.all.filter(s=>selKeys.includes(s.key));
-  if(!source || !source.length){
-    ctx.strokeStyle="#1b2a4a"; ctx.strokeRect(40,20,c.width-80,c.height-50);
-    const y0=c.height-30; ctx.beginPath(); ctx.moveTo(40,y0); ctx.lineTo(c.width-40,y0); ctx.stroke();
-    return;
-  }
-  const S=+CUR.spot, em=+CUR.em, range=mult*em; const xMin=Math.max(0,S-range*1.1), xMax=S+range*1.1;
-  const N=340, xs=[], series=source.map(()=>[]);
-  for(let i=0;i<=N;i++){
-    const ST=xMin+(xMax-xMin)*i/N; xs.push(ST);
-    source.forEach((s,idx)=>{ series[idx].push(payoffFromLegs(ST,s.legs,s.prem0_sh)); });
-  }
-  let yMin=0,yMax=0; series.forEach(a=>a.forEach(v=>{yMin=Math.min(yMin,v); yMax=Math.max(yMax,v)}));
-  if(yMin===yMax){yMin-=1;yMax+=1} const pad=(yMax-yMin)*0.12; yMin-=pad; yMax+=pad;
-  const X=x=>((x-xMin)/(xMax-xMin))*(c.width-60)+40; const Y=y=>c.height-30 - ((y-yMin)/(yMax-yMin))*(c.height-60);
-  ctx.strokeStyle="#1b2a4a"; ctx.strokeRect(40,20,c.width-80,c.height-50);
-  const xS=X(S); ctx.beginPath(); ctx.moveTo(xS,20); ctx.lineTo(xS,c.height-30); ctx.stroke(); const y0=Y(0); ctx.beginPath(); ctx.moveTo(40,y0); ctx.lineTo(c.width-40,y0); ctx.stroke();
-  ctx.fillStyle="#a4afc6"; ctx.font="12px Segoe UI, Roboto"; ctx.fillText(`S=₹${S.toFixed(2)}`, xS+4, 30);
-
-  source.forEach((s,idx)=>{
-    const col=['#60a5fa','#34d399','#fbbf24','#f472b6','#22d3ee','#e5e7eb'][idx%6];
-    ctx.beginPath(); ctx.strokeStyle=col; ctx.lineWidth=2;
-    series[idx].forEach((v,i)=>{ const px=X(xs[i]), py=Y(v); if(i===0) ctx.moveTo(px,py); else ctx.lineTo(px,py); });
-    ctx.stroke();
-  });
-}
+// Removed chart-related functions - not needed for new interface
 
 /* CSV download helper */
 function downloadCSV(rows, filename){
@@ -1288,7 +1322,7 @@ def check_dependencies():
 
 def main():
     ap = argparse.ArgumentParser(description="IV Agent – Full strategy set with ranking + website")
-    ap.add_argument("--tickers", type=str, default="RELIANCE,ICICIBANK,SBIN,TCS,INFY")
+    ap.add_argument("--tickers", type=str, default="AMBUJACEM,AXISBANK,APOLLOHOSP,ASIANPAINT,BAJAJ_AUTO,BAJFINANCE,BEL,BPCL,BRITANNIA,BSE,DALBHARAT,DIVISLAB,DIXON,EICHERMOT,GRASIM,HAVELLS,HCLTECH,HDFCBANK,HDFCLIFE,HEROMOTOCO,HINDALCO,ICICIBANK,ICICIPRULI,INDIGO,INDUSINDBK,INFY,ITC,JSWSTEEL,JINDALSTEL,JUBLFOOD,KOTAKBANK,LAURUSLABS,LICHSGFIN,LT,LTIM,M&M,ONGC,RELIANCE,SBIN,SHREECEM,TATAMOTORS,TATASTEEL,TCS,TECHM,TITAN,UPL,ADANIENT,ADANIPORTS")
     ap.add_argument("--days", type=int, default=30)  # target for NEAR expiry
     ap.add_argument("--risk_free", type=float, default=0.07)
     ap.add_argument("--yield_div", type=float, default=0.00)
