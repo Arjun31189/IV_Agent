@@ -20,23 +20,22 @@ Homepage shows stock cards only; click a card → detail panel with:
   • Payoff chart (per LOT) computed from legs (supports calendars)
   • Orders (BUY/SELL, NEAR/FAR, CALL/PUT, strike, qty)
   • Summary row (Credit/Debit, B/E, Max P/L per lot, ROI, POP)
+  • Risk row (EV/lot, EV/Margin%, CVaR 5%)
   • P&L key-points table (Spot, B/Es, ±1σ, ±2σ)
   • Aggregate Greeks per lot (Δ, Γ, Θ/day, Vega)
   • Download P&L / Greeks of selected strategy as CSV
 
 New in this version:
-  • --strike_mode sigma|delta|prob|ev
-    - sigma: original ±k·σ / width% approach (default)
-    - delta: target |Δ| for short & wing strikes (e.g., 0.18 / 0.05)
-    - prob : target tail probabilities under lognormal for shorts/wings
-    - ev   : coarse-grid EV optimizer for the Iron Condor (keeps others sigma unless adapted below)
-  • Robust breakeven finder + denser scan for POP
-  • Optional delta/prob strike picking for BPS/BCS/BECS/BEPS
+  • --strike_mode sigma|delta|prob|ev (kept from last build)
+  • --pop_model lognormal|normal (default: lognormal) → drives POP/EV/CVaR
+  • Robust EV & CVaR(5%) calculator under chosen pop_model
+  • --profile path.json: load your house defaults (CLI still overrides)
 
 Run (example):
-  python iv_agent.py --tickers "RELIANCE,ICICIBANK,SBIN" \
-    --days 30 --live_iv --use_yfinance_fallback --top_n 3 --open_html \
-    --strike_mode delta --short_delta 0.18 --wing_delta 0.05
+  python iv_agent.py --tickers "RELIANCE,ICICIBANK,SBIN" ^
+    --days 30 --live_iv --use_yfinance_fallback --top_n 3 --open_html ^
+    --strike_mode delta --short_delta 0.18 --wing_delta 0.05 ^
+    --pop_model lognormal --profile house_defaults.json
 """
 
 from __future__ import annotations
@@ -66,7 +65,7 @@ def bs_price(S: float, K: float, t: float, r: float, sigma: float, q: float = 0.
 # ---- Extra Math Helpers (Delta / Tail-Prob / Inverse-Normal etc.) -----------
 
 def inv_norm_cdf(p: float) -> float:
-    """Approximate inverse CDF (Acklam). p in (0,1)."""
+    """Approx inverse CDF (Acklam)."""
     p = min(max(p, 1e-12), 1-1e-12)
     a1=-3.969683028665376e+01; a2= 2.209460984245205e+02; a3=-2.759285104469687e+02
     a4= 1.383577518672690e+02; a5=-3.066479806614716e+01; a6= 2.506628277459239e+00
@@ -96,7 +95,6 @@ def put_delta(S,K,t,r,sigma,q):
     return math.exp(-q*t)*(norm_cdf(d1_val(S,K,t,r,sigma,q))-1.0)
 
 def strike_for_target_call_delta(S,t,r,q,sigma,target_delta):
-    """Find K s.t. call delta ~= target_delta (0..1)."""
     lo, hi = S*0.2, S*5.0
     for _ in range(60):
         mid = (lo+hi)/2.0
@@ -106,17 +104,15 @@ def strike_for_target_call_delta(S,t,r,q,sigma,target_delta):
     return (lo+hi)/2.0
 
 def strike_for_target_put_delta(S,t,r,q,sigma,target_abs_delta):
-    """Find K for OTM put (delta negative; abs≈target_abs_delta)."""
     lo, hi = S*0.2, S*5.0
     for _ in range(60):
         mid = (lo+hi)/2.0
         d = abs(put_delta(S, mid, t, r, sigma, q))
-        if d > target_abs_delta: hi = mid   # deeper ITM (bigger |Δ|)
+        if d > target_abs_delta: hi = mid
         else: lo = mid
     return (lo+hi)/2.0
 
 def strike_for_otm_prob(S,t,r,q,sigma, upper_tail_prob: float, is_call: bool) -> float:
-    """Choose K so that P(ST > K)=p (call) or P(ST < K)=p (put) under lognormal."""
     mu = math.log(S) + (r - q - 0.5*sigma*sigma)*t
     s  = sigma*math.sqrt(t)
     if is_call:
@@ -175,6 +171,9 @@ class Strat:
     max_loss_sh: Optional[float]
     roi: Optional[float]
     pop: Optional[float]
+    ev_sh: Optional[float]
+    cvar5_sh: Optional[float]
+    ev_margin_ratio: Optional[float]
     notes: str
 
 # ------------------------------ NSE Fetch ------------------------------------
@@ -222,7 +221,7 @@ def atm_iv_for_exp(data: dict, exp: str, spot: float) -> Optional[float]:
     if not rows: return None
     best=None; atm=None
     for r in rows:
-        sp=r.get("strikePrice"); 
+        sp=r.get("strikePrice")
         if sp is None: continue
         d=abs(float(sp)-spot)
         if best is None or d<best:
@@ -298,16 +297,24 @@ def pnl_at(S: float, r: float, q: float, legs: List[Leg], prem0: float) -> float
     value_now = sum(price_leg_now(S, r, q, L) for L in legs)
     return value_now - prem0
 
-# ------- Robust breakevens + POP scan (denser grid for accuracy) --------------
+# ------- POP/EV/CVaR (normal/lognormal) + robust BEs --------------------------
+
+def lognorm_params(S: float, t: float, r: float, q: float, sigma: float) -> Tuple[float,float]:
+    """Return (mu, s) for ln(ST) under Black–Scholes risk-neutral dynamics approximation."""
+    s = sigma * math.sqrt(max(1e-12, t))
+    mu = math.log(max(1e-9, S)) + (r - q - 0.5*sigma*sigma) * t
+    return mu, s
+
+def lognorm_cdf(x: float, mu: float, s: float) -> float:
+    if x <= 0: return 0.0
+    return norm_cdf((math.log(x) - mu) / max(1e-12, s))
 
 def find_breakevens(xs: List[float], ys: List[float], S: float) -> Tuple[Optional[float], Optional[float]]:
     beL = None; beH = None
     roots = []
     for i in range(1, len(xs)):
-        if ys[i-1] == 0.0:
-            roots.append(xs[i-1]); continue
-        if ys[i] == 0.0:
-            roots.append(xs[i]); continue
+        if ys[i-1] == 0.0: roots.append(xs[i-1]); continue
+        if ys[i]   == 0.0: roots.append(xs[i]); continue
         if ys[i-1]*ys[i] < 0:
             x1,x2=xs[i-1],xs[i]; y1,y2=ys[i-1],ys[i]
             xz = x1 - y1*(x2-x1)/(y2-y1)
@@ -319,29 +326,95 @@ def find_breakevens(xs: List[float], ys: List[float], S: float) -> Tuple[Optiona
             if r_ >= S and beH is None: beH = r_
     return beL, beH
 
-def scan_metrics(S: float, em: float, r: float, q: float, legs: List[Leg], prem0: float) -> Tuple[float,float,Optional[float],Optional[float],float]:
+def scan_metrics(
+    S: float, em: float, t: float, sigma: float, r: float, q: float,
+    legs: List[Leg], prem0: float, pop_model: str
+) -> Tuple[float,float,Optional[float],Optional[float],Optional[float],Optional[float],Optional[float],float]:
+    """
+    Returns:
+      maxP, maxL, beL, beH, POP, EV_sh, CVaR5_sh, approx_margin_sh
+    - POP/EV/CVaR computed under pop_model ∈ {normal, lognormal}
+    - approx_margin_sh = defined max loss if known; else worst loss on ±3.5σ grid
+    """
     lo = max(0.0, S - 3.5*em); hi = S + 3.5*em
     N = 1400
     xs = [lo + (hi-lo)*i/N for i in range(N+1)]
     ys = [pnl_at(x, r, q, legs, prem0) for x in xs]
+
     maxP = max(ys); minP = min(ys)
     beL, beH = find_breakevens(xs, ys, S)
-    # POP integrate
-    def z(x): return (x - S) / (em if em>1e-9 else 1.0)
-    pop_num = 0.0; pop_den = 0.0
+
+    # interval weights for POP/EV/CVaR
+    weights = []
+    if pop_model == "normal":
+        denom = em if em>1e-9 else 1.0
+        for i in range(N):
+            x1,x2=xs[i],xs[i+1]
+            w = norm_cdf((x2-S)/denom) - norm_cdf((x1-S)/denom)
+            weights.append(max(0.0,w))
+    else:  # lognormal
+        mu, s = lognorm_params(S, t, r, q, sigma)
+        for i in range(N):
+            x1,x2=xs[i],xs[i+1]
+            w = lognorm_cdf(x2, mu, s) - lognorm_cdf(x1, mu, s)
+            weights.append(max(0.0,w))
+
+    # Normalize small numeric drift
+    totW = sum(weights) or 1.0
+    weights = [w/totW for w in weights]
+
+    # POP
+    pop_num = 0.0
     for i in range(N):
-        x1, x2 = xs[i], xs[i+1]
-        w = norm_cdf(z(x2)) - norm_cdf(z(x1))
-        if ys[i] >= 0 and ys[i+1] >= 0: pop_num += w
-        elif ys[i] * ys[i+1] < 0:
-            m = x1 - ys[i]*(x2-x1)/(ys[i+1]-ys[i])
-            w1 = norm_cdf(z(m)) - norm_cdf(z(x1))
-            w2 = norm_cdf(z(x2)) - norm_cdf(z(m))
-            if ys[i] >= 0: pop_num += w1
+        y1, y2 = ys[i], ys[i+1]
+        w = weights[i]
+        if y1 >= 0 and y2 >= 0: pop_num += w
+        elif y1 * y2 < 0:
+            # split weight at root proportionally
+            x1,x2=xs[i],xs[i+1]
+            xr = x1 - y1*(x2-x1)/(y2-y1)
+            if pop_model == "normal":
+                denom = em if em>1e-9 else 1.0
+                w1 = norm_cdf((xr-S)/denom) - norm_cdf((x1-S)/denom)
+            else:
+                mu,s = lognorm_params(S, t, r, q, sigma)
+                w1 = lognorm_cdf(xr, mu, s) - lognorm_cdf(x1, mu, s)
+            w1 = max(0.0, min(1.0, w1))
+            w2 = max(0.0, w - w1)
+            if y1 >= 0: pop_num += w1
             else: pop_num += w2
-        pop_den += w
-    pop = pop_num / pop_den if pop_den>0 else None
-    return maxP, -minP if minP<0 else 0.0, beL, beH, pop
+    pop = pop_num
+
+    # EV
+    ev = 0.0
+    for i in range(N):
+        ymid = 0.5*(ys[i] + ys[i+1])
+        ev += ymid * weights[i]
+    ev_sh = ev
+
+    # CVaR (5%): expected P&L in worst 5%
+    alpha = 0.05
+    # build discrete distribution of (pnl, prob)
+    samples = []
+    for i in range(N):
+        ymid = 0.5*(ys[i] + ys[i+1])
+        w = weights[i]
+        if w > 0: samples.append((ymid, w))
+    samples.sort(key=lambda x: x[0])  # most negative first
+    cum = 0.0; loss_sum = 0.0
+    for y, w in samples:
+        if cum + w <= alpha:
+            loss_sum += y * w; cum += w
+        else:
+            take = max(0.0, alpha - cum)
+            loss_sum += y * take; cum += take
+            break
+    cvar5 = loss_sum / (alpha if alpha>0 else 1.0)
+
+    # margin proxy per share
+    approx_margin_sh = max(1e-9, -minP)  # use worst loss on grid if undefined elsewhere
+
+    return maxP, -minP if minP<0 else 0.0, beL, beH, pop, ev_sh, cvar5, approx_margin_sh
 
 # ------------------------- Strike selection utilities -------------------------
 
@@ -355,12 +428,6 @@ def choose_strikes(
     short_delta: float, wing_delta: float, short_tail_prob: float, wing_tail_prob: float,
     k_sigma: float, width_pct: float
 ) -> Tuple[int,int,int,int]:
-    """
-    Return (short_put, long_put, short_call, long_call) integer strikes for a symmetric IC shell.
-    - mode='sigma'  : shorts at ± k_sigma*em ; wings wider by width_pct*spot
-    - mode='delta'  : shorts at |Δ|=short_delta; wings at |Δ|=wing_delta
-    - mode='prob'   : shorts at tail probs; wings at wing tail probs
-    """
     if mode == "delta":
         sp = round_to_stride(strike_for_target_put_delta(S, t, r, q, sigma, short_delta), stride)
         lp = round_to_stride(strike_for_target_put_delta(S, t, r, q, sigma, wing_delta),  stride)
@@ -393,7 +460,6 @@ def choose_strikes(
 def expected_value_of_legs_normal(
     S: float, em: float, r: float, q: float, legs: List[Leg], prem0: float, span_mult: float = 3.0
 ) -> float:
-    """Approx EV under Normal(S, em^2) for payoff at evaluation (not risk-neutral)."""
     lo = max(0.0, S - span_mult*em); hi = S + span_mult*em
     N = 900
     dx = (hi - lo) / N
@@ -409,7 +475,6 @@ def optimize_ic_ev(
     S: float, em: float, tN: float, r: float, q: float, iv: float, stride: int,
     k_list: List[float], w_list: List[float]
 ) -> Tuple[Tuple[int,int,int,int], float]:
-    """Grid over k_sigma and width_pct to maximize EV for Short IC."""
     best = None; best_ev = -1e99
     for k_sigma in (k_list or [1.0, 1.2]):
         for width_pct in (w_list or [0.02]):
@@ -438,7 +503,8 @@ def build_strategies_full(
     strike_mode: str,
     short_delta: float, wing_delta: float,
     short_tail_prob: float, wing_tail_prob: float,
-    ev_k_list: List[float], ev_w_list: List[float]
+    ev_k_list: List[float], ev_w_list: List[float],
+    pop_model: str
 ) -> List[Strat]:
 
     tN, emN, _ = stride_and_em(S, iv, days_near)
@@ -448,13 +514,24 @@ def build_strategies_full(
     results: List[Strat] = []
 
     def prem0(legs): return sum(price_leg_entry(S,r,q,L) for L in legs)
+
     def finish(key,name,group,style,legs,notes):
         p0 = prem0(legs)
-        maxP, maxL, beL, beH, pop = scan_metrics(S, emN, r, q, legs, p0)
+        maxP, maxL, beL, beH, pop, ev_sh, cvar5_sh, approx_margin_sh = scan_metrics(
+            S, emN, tN, iv, r, q, legs, p0, pop_model
+        )
         roi = None
         if style=="credit" and maxL>0: roi = (p0 if p0>0 else 0.0) / maxL
         elif style=="debit"  and p0<0 and maxP>0: roi = maxP / (-p0)
-        results.append(Strat(key,name,group,style,legs,p0,beL,beH,maxP,maxL,roi,pop,notes))
+
+        # EV/Margin ratio (approx)
+        ev_margin_ratio = None
+        if approx_margin_sh and approx_margin_sh>0:
+            ev_margin_ratio = (ev_sh / approx_margin_sh)
+
+        results.append(Strat(
+            key,name,group,style,legs,p0,beL,beH,maxP,maxL,roi,pop,ev_sh,cvar5_sh,ev_margin_ratio,notes
+        ))
 
     # --- Iron Condor (Short) with selectable strike logic / EV optimizer ---
     if strike_mode == "ev":
@@ -474,7 +551,7 @@ def build_strategies_full(
            make_leg('call','short',sc,1,tN,iv,0.0,iv), make_leg('call','long',lc,1,tN,iv,0.0,iv) ]
     finish("IC","Short Iron Condor","Neutral","credit",legs,ic_notes)
 
-    # --- Iron Butterfly (Short) wings via same selection logic (ATM body) ---
+    # --- Iron Butterfly (Short) ---
     atm  = round_to_stride(S, stride)
     if strike_mode == "delta":
         lp_ib = round_to_stride(strike_for_target_put_delta(S, tN, r, q, iv, wing_delta), stride)
@@ -500,7 +577,7 @@ def build_strategies_full(
         legs=[ make_leg('put','short',atm,1,tN,iv,0.0,iv), make_leg('call','short',atm,1,tN,iv,0.0,iv) ]
         finish("SSTRD","Short Straddle","Neutral","credit",legs,"ATM naked")
 
-    # --- Long Strangle / Straddle (sigma-based distance preserved) ---
+    # --- Long Strangle / Straddle ---
     kC = round_to_stride(S + sigma_ls*emN, stride); kP = round_to_stride(S - sigma_ls*emN, stride)
     legs=[ make_leg('call','long',kC,1,tN,iv,0.0,iv), make_leg('put','long',kP,1,tN,iv,0.0,iv) ]
     finish("LS","Long Strangle","Neutral","debit",legs,f"±{sigma_ls:.2f}σ long-vol")
@@ -508,7 +585,7 @@ def build_strategies_full(
     legs=[ make_leg('call','long',atm,1,tN,iv,0.0,iv), make_leg('put','long',atm,1,tN,iv,0.0,iv) ]
     finish("LSTRD","Long Straddle","Neutral","debit",legs,"ATM long-vol")
 
-    # --- Bull Put Spread (credit): optional delta/prob selection ---
+    # --- Bull Put Spread (credit) ---
     if strike_mode == "delta":
         sp2 = round_to_stride(strike_for_target_put_delta(S,tN,r,q,iv, short_delta), stride)
         lp2 = round_to_stride(strike_for_target_put_delta(S,tN,r,q,iv, max(wing_delta, min(0.5*short_delta, 0.10))), stride)
@@ -521,12 +598,11 @@ def build_strategies_full(
     legs=[ make_leg('put','short',sp2,1,tN,iv,0.0,iv), make_leg('put','long',lp2,1,tN,iv,0.0,iv) ]
     finish("BPS","Bull Put Spread","Bullish","credit",legs,"OTM put spread")
 
-    # --- Bull Call Spread (debit): optional delta/prob selection (on calls) ---
+    # --- Bull Call Spread (debit) ---
     if strike_mode == "delta":
         lc1 = round_to_stride(strike_for_target_call_delta(S,tN,r,q,iv, max(0.30, short_delta)), stride)
         sc1 = round_to_stride(strike_for_target_call_delta(S,tN,r,q,iv, max(0.60, short_delta + 0.25)), stride)
     elif strike_mode == "prob":
-        # smaller upper-tail prob for long, larger for short (further OTM)
         lc1 = round_to_stride(strike_for_otm_prob(S,tN,r,q,iv, max(0.30, short_tail_prob), is_call=True), stride)
         sc1 = round_to_stride(strike_for_otm_prob(S,tN,r,q,iv, max(0.60, short_tail_prob + 0.25), is_call=True), stride)
     else:
@@ -535,7 +611,7 @@ def build_strategies_full(
     legs=[ make_leg('call','long',lc1,1,tN,iv,0.0,iv), make_leg('call','short',sc1,1,tN,iv,0.0,iv) ]
     finish("BCS","Bull Call Spread","Bullish","debit",legs,"OTM call spread")
 
-    # --- Bear Call Spread (credit): optional delta/prob selection ---
+    # --- Bear Call Spread (credit) ---
     if strike_mode == "delta":
         sc2 = round_to_stride(strike_for_target_call_delta(S,tN,r,q,iv, short_delta), stride)
         lc2 = round_to_stride(strike_for_target_call_delta(S,tN,r,q,iv, max(wing_delta, min(0.5*short_delta, 0.10))), stride)
@@ -548,7 +624,7 @@ def build_strategies_full(
     legs=[ make_leg('call','short',sc2,1,tN,iv,0.0,iv), make_leg('call','long',lc2,1,tN,iv,0.0,iv) ]
     finish("BECS","Bear Call Spread","Bearish","credit",legs,"OTM call spread")
 
-    # --- Bear Put Spread (debit): optional delta/prob selection ---
+    # --- Bear Put Spread (debit) ---
     if strike_mode == "delta":
         sp3 = round_to_stride(strike_for_target_put_delta(S,tN,r,q,iv, max(0.30, short_delta)), stride)
         lp3 = round_to_stride(strike_for_target_put_delta(S,tN,r,q,iv, max(0.60, short_delta + 0.25)), stride)
@@ -561,7 +637,7 @@ def build_strategies_full(
     legs=[ make_leg('put','long',sp3,1,tN,iv,0.0,iv), make_leg('put','short',lp3,1,tN,iv,0.0,iv) ]
     finish("BEPS","Bear Put Spread","Bearish","debit",legs,"OTM put spread")
 
-    # --- Call Ratio Backspread (1 short ATM, 2 long OTM calls) ---
+    # --- Call Ratio Backspread ---
     k_sell = atm; k_buy = round_to_stride(S + 1.0*emN, stride)
     legs=[ make_leg('call','short',k_sell,1,tN,iv,0.0,iv), make_leg('call','long',k_buy,2,tN,iv,0.0,iv) ]
     finish("CRB","Call Ratio Backspread","Bullish","debit",legs,"1× short ATM, 2× long OTM")
@@ -594,12 +670,15 @@ def build_strategies_full(
     finish("BEAR_CONDOR","Bear Condor (puts)","Bearish","debit",legs,"two put spreads")
 
     # --- Long Iron Condor / Long Iron Butterfly (debit versions) ---
-    legs=[ make_leg('put','long',atm,1,tN,iv,0.0,iv), make_leg('put','short',lp_ib,1,tN,iv,0.0,iv),
-           make_leg('call','long',atm,1,tN,iv,0.0,iv), make_leg('call','short',lc_ib,1,tN,iv,0.0,iv) ]
+    legs=[ make_leg('put','long',sp,1,tN,iv,0.0,iv), make_leg('put','short',lp,1,tN,iv,0.0,iv),
+           make_leg('call','long',sc,1,tN,iv,0.0,iv), make_leg('call','short',lc,1,tN,iv,0.0,iv) ]
+    finish("LIC","Long Iron Condor","Other","debit",legs,"reverse IC")
+
+    legs=[ make_leg('put','long',atm,1,tN,iv,0.0,iv), make_leg('put','short',atm-lp_ib+atm,1,tN,iv,0.0,iv),
+           make_leg('call','long',atm,1,tN,iv,0.0,iv), make_leg('call','short',atm+lc_ib-atm,1,tN,iv,0.0,iv) ]
     finish("LIB","Long Iron Butterfly","Other","debit",legs,"reverse IB")
 
-
-    # --- Jade Lizard: short put + short call + long higher call (ensure credit ≥ call width) ---
+    # --- Jade Lizard ---
     sp_j = round_to_stride(S - 0.7*emN, stride)
     sc_j = round_to_stride(S + 0.7*emN, stride)
     wSP = width_from_pct(S, w_bps_pct, stride)
@@ -613,7 +692,7 @@ def build_strategies_full(
         jl_legs[-1] = make_leg('call','long',lc_j,1,tN,iv,0.0,iv)
     finish("JL","Jade Lizard","Bullish","credit",jl_legs,"no upside risk if credit ≥ call width")
 
-    # --- Risk Reversal / Range Forward (near zero-cost hedge) ---
+    # --- Risk Reversal / Range Forward ---
     k_call = round_to_stride(S + 0.6*emN, stride); k_put = round_to_stride(S - 0.6*emN, stride)
     rr_legs=[ make_leg('call','long',k_call,1,tN,iv,0.0,iv), make_leg('put','short',k_put,1,tN,iv,0.0,iv) ]
     finish("RR","Risk Reversal (Range Forward)","Other","other",rr_legs,"near zero-cost directional hedge")
@@ -624,7 +703,7 @@ def build_strategies_full(
     strap=[ make_leg('call','long',atm,2,tN,iv,0.0,iv), make_leg('put','long',atm,1,tN,iv,0.0,iv) ]
     finish("STRAP","Strap (2C+1P @ATM)","Other","debit",strap,"bullish long-vol tilt")
 
-    # --- Batman (two narrow flies around ±d) & Double Plateau (two narrow condors) ---
+    # --- Batman & Double Plateau ---
     d = 0.7*emN; wing = max(suggest_stride(S), stride)
     bat_legs=[]
     for sign in (+1, -1):
@@ -642,7 +721,7 @@ def build_strategies_full(
                      make_leg('call','short',scD,1,tN,iv,0.0,iv), make_leg('call','long',lcD,1,tN,iv,0.0,iv) ]
     finish("DPLAT","Double Plateau (double condor)","Neutral","debit",dp_legs,"two condors around ±0.7σ")
 
-    # --- Calendars (need next expiry & iv2) – evaluated at NEAR expiry ---
+    # --- Calendars @ near-expiry ---
     if tF and iv2:
         rem = max(1e-9, tF - tN)
         legs=[ make_leg('call','long',atm,1,tF,iv2,rem,iv2), make_leg('call','short',atm,1,tN,iv,0.0,iv) ]
@@ -664,7 +743,9 @@ def score_strategy(s: Strat, S: float, em: float) -> float:
     elif s.be_high is not None: span = max(0.0, (s.be_high - S)/(2*em + 1e-9))
     uncapped_credit = (s.style=="credit" and (s.max_loss_sh==0.0 or s.max_loss_sh is None))
     penalty = 0.15 if uncapped_credit else 0.0
-    return 0.55*pop + 0.30*min(max(roi,0.0),2.0) + 0.20*min(span,1.0) - penalty
+    # small bonus for good EV/Margin
+    evm = 0.0 if (s.ev_margin_ratio is None) else max(0.0, min(0.5, s.ev_margin_ratio))
+    return 0.50*pop + 0.27*min(max(roi,0.0),2.0) + 0.18*min(span,1.0) + 0.10*evm - penalty
 
 # ------------------------------ HTML -----------------------------------------
 
@@ -741,7 +822,7 @@ HTML = r"""<!doctype html>
 <body>
 <div class="wrap">
   <h1>IV Agent – Top Strategies</h1>
-  <div class="meta">Generated: __GENERATED__ · Horizon: __DAYS__ days · Data: NSE · <a class="btn" href="__CSV_NAME__" download>CSV</a></div>
+  <div class="meta">Generated: __GENERATED__ · Horizon: __DAYS__ days · Data: NSE · POP model: __POP_MODEL__ · <a class="btn" href="__CSV_NAME__" download>CSV</a></div>
   <div class="toolbar"><input id="q" class="search" placeholder="Search symbol…"/></div>
   <div id="cards" class="grid"></div>
 </div>
@@ -773,6 +854,11 @@ HTML = r"""<!doctype html>
             <tr><th>Credit/Debit</th><th>B/E</th><th>Max P/L (₹/lot)</th><th>ROI%</th><th>POP%</th></tr>
           </thead><tbody></tbody></table>
 
+          <div style="margin-top:12px;color:#cbd5e1"><b>Risk metrics</b></div>
+          <table id="riskTbl"><thead>
+            <tr><th>EV (₹/lot)</th><th>EV/Margin%</th><th>CVaR 5% (₹/lot)</th></tr>
+          </thead><tbody><tr><td colspan="3">—</td></tr></tbody></table>
+
           <div style="margin-top:12px;color:#cbd5e1"><b>Greeks @ Spot (per lot)</b></div>
           <table id="greeksTbl"><thead>
             <tr><th>Δ</th><th>Γ</th><th>Θ (per day)</th><th>Vega</th></tr>
@@ -802,7 +888,7 @@ HTML = r"""<!doctype html>
 </div>
 
 <script>
-/* ---------- Polyfill for Math.erf (some browsers miss it) ---------- */
+/* ---------- Polyfill for Math.erf ---------- */
 if (typeof Math.erf !== 'function') {
   Math.erf = function(x){
     const sign = (x>=0)? 1 : -1;
@@ -821,7 +907,6 @@ function bsPrice(S,K,t,r,sigma,q,type){
   if(type==='call') return S*Math.exp(-q*t)*cdf(d1)-K*Math.exp(-r*t)*cdf(d2);
   return K*Math.exp(-r*t)*cdf(-d2)-S*Math.exp(-q*t)*cdf(-d1);
 }
-/* Greeks */
 function bsGreeks(S,K,t,r,sigma,q,type){
   if (t<=1e-9) {
     const intrinsic = (type==='call') ? (S>K) : (K>S);
@@ -837,9 +922,8 @@ function bsGreeks(S,K,t,r,sigma,q,type){
   else delta = Math.exp(-q*t)*(Nd1-1);
   const gamma = (Math.exp(-q*t)*pdf)/(S*sigma*Math.sqrt(t));
   const theta = -(S*Math.exp(-q*t)*pdf*sigma)/(2*Math.sqrt(t))
-              - (type==='call'
-                   ? ( -q*S*Math.exp(-q*t)*Nd1 + r*K*Math.exp(-r*t)*Nd2 )
-                   : ( -q*S*Math.exp(-q*t)*(Nd1-1) - r*K*Math.exp(-r*t)*cdf(-d2) ));
+                - (type==='call' ? ( -q*S*Math.exp(-q*t)*Nd1 + r*K*Math.exp(-r*t)*Nd2 )
+                                 : ( -q*S*Math.exp(-q*t)*(Nd1-1) + r*K*Math.exp(-r*t)*cdf(-d2) ));
   const vega  = S*Math.exp(-q*t)*pdf*Math.sqrt(t);
   return {delta, gamma, theta_per_year:theta, vega};
 }
@@ -906,6 +990,7 @@ function legsToSummary(legs){ return legs.map(legText).join(', '); }
 /* ---------- Data ---------- */
 const DATA = __DATA_JSON__;
 const TOPN = __TOPN__;
+const POP_MODEL = "__POP_MODEL__";
 const cards = document.getElementById('cards');
 document.getElementById('q').addEventListener('input', e=>{
   const t=e.target.value.toLowerCase();
@@ -926,6 +1011,7 @@ DATA.forEach((d,i)=>{
 const detail=document.getElementById('detail');
 const d_sym=document.getElementById('d_sym'); const d_meta=document.getElementById('d_meta');
 const tblBody = document.querySelector('#tbl tbody');
+const riskBody = document.querySelector('#riskTbl tbody');
 const legend=document.getElementById('legend'); const tabs=document.getElementById('tabs');
 const toggleAll=document.getElementById('toggleAll');
 const strategyList = document.getElementById('strategyList');
@@ -942,15 +1028,16 @@ function openDetail(i){
   CUR=DATA[i];
   if (!CUR || !Array.isArray(CUR.all) || CUR.all.length===0) {
     d_sym.textContent = CUR?.symbol || '—';
-    d_meta.textContent=`Lot: ${CUR?.lot||'—'} · Spot: ₹${(CUR?.spot||0).toFixed(2)} · No strategies computed`;
+    d_meta.textContent=`Lot: ${CUR?.lot||'—'} · Spot: ₹${(CUR?.spot||0).toFixed(2)} · No strategies computed · POP model: ${POP_MODEL}`;
     strategyList.innerHTML = '';
     legend.innerHTML = '';
     tblBody.innerHTML = '<tr><td colspan="5">No strategies available for this symbol.</td></tr>';
+    riskBody.innerHTML = '<tr><td colspan="3">—</td></tr>';
     greeksBody.innerHTML = '<tr><td colspan="4">—</td></tr>';
     pnlBody.innerHTML = '<tr><td colspan="3">—</td></tr>';
     ordersBox.textContent = '—';
     detail.style.display='flex';
-    renderTabs(); draw(); 
+    renderTabs(); draw();
     return;
   }
   const bestKey = (CUR.top && CUR.top[0]) ? CUR.top[0].key : CUR.all[0].key;
@@ -958,7 +1045,7 @@ function openDetail(i){
 
   d_sym.textContent=CUR.symbol;
   const ivx = (CUR.iv2!=null && isFinite(CUR.iv2)) ? (' · IVx '+(CUR.iv2*100).toFixed(1)+'%') : '';
-  d_meta.textContent=`Expiry near: ${CUR.exp_near||'—'} · next: ${CUR.exp_next||'—'} · Lot: ${CUR.lot} · Spot: ₹${(+CUR.spot).toFixed(2)} · IVn ${(CUR.iv*100).toFixed(1)}%${ivx}`;
+  d_meta.textContent=`Expiry near: ${CUR.exp_near||'—'} · next: ${CUR.exp_next||'—'} · Lot: ${CUR.lot} · Spot: ₹${(+CUR.spot).toFixed(2)} · IVn ${(CUR.iv*100).toFixed(1)}%${ivx} · POP model: ${POP_MODEL}`;
 
   renderStrategyList();
   renderTabs();
@@ -976,7 +1063,6 @@ function allStratsBestFirst(){
   return [best, ...rest];
 }
 
-/* --------- helper badges --------- */
 function styleEmoji(style){
   if (style==='credit') return '💰';
   if (style==='debit')  return '💸';
@@ -991,7 +1077,6 @@ function beSpanInfo(s){
   return {label: 'No BE', val: 0.0};
 }
 
-/* --------- Strategy list renderer --------- */
 function renderStrategyList(){
   strategyList.innerHTML='';
   const arr = allStratsBestFirst();
@@ -1007,7 +1092,6 @@ function renderStrategyList(){
     const pop=document.createElement('span'); pop.className='badge '+((s.pop||0)>=0.6?'ok':((s.pop||0)>=0.5?'':'warn'));
     pop.textContent = 'POP ' + (s.pop==null?'—':(s.pop*100).toFixed(0)) + '%';
     const roi=document.createElement('span'); roi.className='badge'; roi.textContent='ROI ' + (s.roi==null?'—':(s.roi*100).toFixed(0)) + '%';
-
     const spanInfo = beSpanInfo(s);
     const spanBadge=document.createElement('span');
     spanBadge.className='badge ' + (spanInfo.val>=1.0 ? 'ok' : (spanInfo.val<0.6 ? 'warn' : ''));
@@ -1024,7 +1108,6 @@ function renderStrategyList(){
   });
 }
 
-/* --------- Legend & toggles --------- */
 function renderLegend(){
   legend.innerHTML='';
   const base = SHOW_ALL ? CUR.all : allStratsBestFirst();
@@ -1067,6 +1150,12 @@ function updateSelectedDetail(){
   tr.innerHTML = `<td>${(cdSh>=0?'+':'')+cdSh.toFixed(2)} / ${cdLot.toFixed(2)}</td><td>${be}</td><td>${maxp_lot} · ${maxl_lot}</td><td>${roi}</td><td>${pop}</td>`;
   tblBody.appendChild(tr);
 
+  // Risk row
+  const ev_lot = (s.ev_sh==null)? '—' : (s.ev_sh*CUR.lot).toFixed(2);
+  const evm_pct = (s.ev_margin_ratio==null)? '—' : (s.ev_margin_ratio*100).toFixed(1);
+  const cvar_lot = (s.cvar5_sh==null)? '—' : (s.cvar5_sh*CUR.lot).toFixed(2);
+  riskBody.innerHTML = `<tr><td>${ev_lot}</td><td>${evm_pct}</td><td>${cvar_lot}</td></tr>`;
+
   const g = aggregateGreeksPerLot(CUR.spot, __R__, __Q__, s, CUR.lot);
   const gRow = formatGreeksRow(g);
   greeksBody.innerHTML = `<tr><td>${gRow[0]}</td><td>${gRow[1]}</td><td>${gRow[2]}</td><td>${gRow[3]}</td></tr>`;
@@ -1089,7 +1178,7 @@ function updateSelectedDetail(){
   dlGreeksBtn.onclick = ()=>{
     const rows=[['Delta','Gamma','Theta/day','Vega']];
     rows.push(gRow);
-    downloadCSV(rows, `${CUR.symbol}_${s.key}_greeks.csv`);
+    downloadCSV(rows, `${CUR.symbol_${'+'}s.key}_greeks.csv`);
   };
 }
 
@@ -1213,7 +1302,24 @@ def main():
     ap.add_argument("--ev_width_pct_grid", type=str, default="0.01,0.015,0.02,0.025",
                     help="CSV of widths (as % of spot) for condor wings (ev mode)")
 
+    # NEW: POP/EV/CVaR model + profile
+    ap.add_argument("--pop_model", type=str, default="lognormal",
+                    choices=["normal","lognormal"], help="distribution for POP/EV/CVaR")
+    ap.add_argument("--profile", type=str, default="", help="JSON file with default args (CLI overrides)")
+
     args = ap.parse_args()
+
+    # Load profile defaults (CLI overrides)
+    if args.profile:
+        try:
+            with open(args.profile, "r", encoding="utf-8") as f:
+                prof = json.load(f)
+            defaults = ap.parse_args([])  # parser defaults snapshot
+            for k,v in prof.items():
+                if hasattr(args, k) and getattr(args, k) == getattr(defaults, k):
+                    setattr(args, k, v)
+        except Exception as e:
+            print(f"[WARN] Could not load profile '{args.profile}': {e}")
 
     # Parse EV grids
     ev_k_list = [float(x) for x in (args.ev_k_sigma_grid or "").split(",") if x.strip()]
@@ -1239,7 +1345,7 @@ def main():
         if iv_near is None: iv_near = iv_map.get(sym, args.default_iv)
         if iv_near and iv_near>1.0: iv_near/=100.0
         if iv_next and iv_next>1.0: iv_next/=100.0
-        if spot is None: 
+        if spot is None:
             if args.use_yfinance_fallback:
                 try:
                     import yfinance as yf
@@ -1248,7 +1354,7 @@ def main():
                     if data is not None and not data.empty:
                         spot = float(data["Close"].iloc[-1])
                 except Exception: pass
-        if spot is None: 
+        if spot is None:
             if args.verbose: print(f"[SKIP] {sym}: no spot")
             continue
 
@@ -1273,7 +1379,8 @@ def main():
             args.strike_mode,
             args.short_delta, args.wing_delta,
             args.short_tail_prob, args.wing_tail_prob,
-            ev_k_list, ev_w_list
+            ev_k_list, ev_w_list,
+            args.pop_model
         )
 
         # Score & pick top N
@@ -1281,7 +1388,7 @@ def main():
         scored.sort(key=lambda x: x[0], reverse=True)
         top = [s for _,s in scored[:max(1,args.top_n)]]
 
-        # CSV rows: one row per TopN strategy with strikes + per-lot economics
+        # CSV rows (Top N)
         def fmt2(x): return "" if x is None else f"{x:.2f}"
         for rank, s in enumerate(top, start=1):
             prem_lot = s.prem0_sh * lot
@@ -1289,6 +1396,9 @@ def main():
             maxl_lot = None if s.max_loss_sh is None else s.max_loss_sh * lot
             pnl_at_spot_per_sh = pnl_at(spot, args.risk_free, args.yield_div, s.legs, s.prem0_sh)
             pnl_at_spot_lot = pnl_at_spot_per_sh * lot
+            ev_lot = "" if s.ev_sh is None else f"{s.ev_sh*lot:.2f}"
+            evm_pct = "" if s.ev_margin_ratio is None else f"{s.ev_margin_ratio*100:.1f}"
+            cvar_lot = "" if s.cvar5_sh is None else f"{s.cvar5_sh*lot:.2f}"
 
             rows_csv.append({
                 "Symbol": sym,
@@ -1303,6 +1413,9 @@ def main():
                 "Range ±1σ": f"{spot-emN:.2f}–{spot+emN:.2f}",
                 "POP%": "" if s.pop is None else f"{s.pop*100:.1f}",
                 "ROI%": "" if s.roi is None else f"{s.roi*100:.1f}",
+                "EV (₹/lot)": ev_lot,
+                "EV/Margin%": evm_pct,
+                "CVaR5% (₹/lot)": cvar_lot,
                 "BE_low": fmt2(s.be_low),
                 "BE_high": fmt2(s.be_high),
                 "Legs / Strikes": legs_summary(s.legs),
@@ -1312,6 +1425,7 @@ def main():
                 "Max Loss (₹/lot)": "" if maxl_lot is None else f"{maxl_lot:.2f}",
                 "PnL @ Spot (₹/lot)": f"{pnl_at_spot_lot:.2f}",
                 "StrikeMode": getattr(args, "strike_mode", "sigma"),
+                "POP_Model": getattr(args, "pop_model", "lognormal"),
             })
 
         # Website payload
@@ -1321,7 +1435,8 @@ def main():
             return {"key":s.key,"name":s.name,"group":s.group,"style":s.style,"legs":legs_to_js(s.legs),
                     "prem0_sh":float(f"{s.prem0_sh:.6f}"),"be_low":s.be_low,"be_high":s.be_high,
                     "max_profit_sh":s.max_profit_sh,"max_loss_sh":s.max_loss_sh,
-                    "roi":s.roi,"pop":s.pop,"notes":s.notes}
+                    "roi":s.roi,"pop":s.pop,"ev_sh":s.ev_sh,"cvar5_sh":s.cvar5_sh,
+                    "ev_margin_ratio":s.ev_margin_ratio,"notes":s.notes}
         js_rows.append({
             "symbol": sym, "lot": int(lot), "spot": float(f"{spot:.6f}"),
             "iv": float(f"{iv_near:.6f}"), "iv2": None if iv_next is None else float(f"{iv_next:.6f}"),
@@ -1343,6 +1458,7 @@ def main():
             .replace("__TOPN__", str(max(1,args.top_n)))
             .replace("__R__", str(args.risk_free))
             .replace("__Q__", str(args.yield_div))
+            .replace("__POP_MODEL__", args.pop_model)
             .replace("__DATA_JSON__", json.dumps(js_rows, ensure_ascii=False))
             )
     with open(args.html_out, "w", encoding="utf-8") as f:
